@@ -6,6 +6,10 @@ const vm = require('node:vm');
 
 const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
 const onlineMenuHtml = fs.readFileSync(path.join(__dirname, '..', 'cardapio online.html'), 'utf8');
+const orderBridge = fs.readFileSync(
+    path.join(__dirname, '..', 'supabase', 'functions', 'order-bridge', 'index.ts'),
+    'utf8'
+);
 
 function extractFunction(startMarker, endMarker, exportName, context) {
     const start = html.indexOf(startMarker);
@@ -184,6 +188,108 @@ test('selecting a pizza size opens the flavor step with that size selected', () 
     assert.deepEqual(JSON.parse(JSON.stringify(context.pm.fl)), []);
 });
 
+test('administrator, manager and cashier PINs require eight digits; other roles retain four', () => {
+    const pinLengthForRole = extractFunction(
+        '        function pinLengthForRole(',
+        '        function updateUserPinRequirements(',
+        'pinLengthForRole',
+        {}
+    );
+
+    for (const role of ['ADMIN', 'GERENTE', 'CAIXA']) {
+        assert.equal(pinLengthForRole(role), 8);
+    }
+    assert.equal(pinLengthForRole('GARCOM'), 4);
+    assert.match(html, /id="pin-input"[^>]*maxlength="8"/);
+    assert.match(html, /Código PIN \(\\?\$\{length\} dígitos\)/);
+});
+
+test('login accepts the saved PIN length so existing accounts can migrate', () => {
+    const input = { value: '12345678' };
+    const modal = { classList: { add() {} } };
+    const context = {
+        users: [{ id: 1, role: 'ADMIN', pin: '12345678', active: true }],
+        currentUser: null,
+        pinLengthForRole: role => ['ADMIN', 'GERENTE', 'CAIXA'].includes(role) ? 8 : 4,
+        toast() {},
+        updateRolePermissions() {},
+        renderUsersTable() {},
+        renderOrdersList() {},
+        document: {
+            getElementById(id) {
+                if (id === 'login-user-select') return { value: '1' };
+                if (id === 'pin-input') return input;
+                if (id === 'login-modal') return modal;
+                throw new Error(`Unexpected element ${id}`);
+            }
+        }
+    };
+    const submitLogin = extractFunction(
+        '        function submitLogin(',
+        '        function toggleFullscreen(',
+        'submitLogin',
+        context
+    );
+
+    submitLogin();
+    assert.equal(context.currentUser.role, 'ADMIN');
+    assert.equal(input.value, '12345678');
+
+    context.users[0].pin = '1234';
+    input.value = '1234';
+    submitLogin();
+    assert.equal(context.currentUser.role, 'ADMIN');
+});
+
+test('pizza flavor filter matches names and descriptions without case or accent sensitivity', () => {
+    const context = {};
+    const pizzaFlavorMatches = extractFunction(
+        '        function pizzaFlavorMatches(',
+        '        function renderPMFlavors(',
+        'pizzaFlavorMatches',
+        context
+    );
+
+    assert.equal(pizzaFlavorMatches(['Calabresa', 'Queijo e cebola'], 'CALAB'), true);
+    assert.equal(pizzaFlavorMatches(['Quatro Queijos', 'Mussarela e gorgonzola'], 'gorgonzola'), true);
+    assert.equal(pizzaFlavorMatches(['Frango com Catupiry', 'Mussarela e frango'], 'catupíry'), true);
+    assert.equal(pizzaFlavorMatches(['Calabresa', 'Queijo e cebola'], 'abacaxi'), false);
+});
+
+test('filtering pizza flavors keeps selected flavors available and shows an empty state', () => {
+    const flavorsList = { innerHTML: '' };
+    const context = {
+        pm: { d: 0, fl: ['Calabresa'], flavorSearch: 'calab' },
+        DOCE: [],
+        PZ: [
+            ['Calabresa', 'Mussarela e calabresa'],
+            ['Frango', 'Mussarela e frango']
+        ],
+        $: id => id === 'pm-flavor-list' ? flavorsList : null
+    };
+    extractFunction(
+        '        function pizzaFlavorMatches(',
+        '        function renderPMFlavors(',
+        'pizzaFlavorMatches',
+        context
+    );
+    const renderPMFlavors = extractFunction(
+        '        function renderPMFlavors(',
+        '        function renderPM(',
+        'renderPMFlavors',
+        context
+    );
+
+    renderPMFlavors();
+    assert.match(flavorsList.innerHTML, /Calabresa/);
+    assert.match(flavorsList.innerHTML, /checked/);
+    assert.doesNotMatch(flavorsList.innerHTML, /Frango/);
+
+    context.pm.flavorSearch = 'inexistente';
+    renderPMFlavors();
+    assert.match(flavorsList.innerHTML, /Nenhum sabor encontrado/);
+});
+
 test('online checkout payload matches the order bridge contract', () => {
     const buildOnlineOrderPayload = extractOnlineMenuFunction(
         '        function roundOnlineMoney(',
@@ -218,6 +324,197 @@ test('online checkout payload matches the order bridge contract', () => {
         total: 82,
         payment: 'Pix'
     });
+});
+
+test('online menu navigation uses the requested restaurant name', () => {
+    const header = onlineMenuHtml.slice(
+        onlineMenuHtml.indexOf('<!-- LOGO -->'),
+        onlineMenuHtml.indexOf('<!-- DESKTOP NAV -->')
+    );
+    assert.match(header, /Restaurante e Pizzaria Gabryelle/);
+    assert.doesNotMatch(header, /GABRYELLE\s*<span[^>]*>PRIME<\/span>/);
+});
+
+test('online pizza size opens an empty flavor selection with the correct maximum', () => {
+    const title = { textContent: '' };
+    const modal = { classList: { remove() {}, add() {} } };
+    const context = {
+        pizzaFlavorSelection: null,
+        getAvailablePizzaFlavors: () => [{ id: 1, name: 'Calabresa', desc: '', category: 'tradicional' }],
+        document: {
+            getElementById(id) {
+                if (id === 'pizzaFlavorModal') return modal;
+                if (id === 'pizzaFlavorTitle') return title;
+                throw new Error(`Unexpected element ${id}`);
+            }
+        },
+        renderPizzaFlavorOptions() {}
+    };
+    const openPizzaFlavorPicker = extractOnlineMenuFunction(
+        '        function openPizzaFlavorPicker(',
+        '        function renderPizzaFlavorOptions(',
+        'openPizzaFlavorPicker',
+        context
+    );
+
+    for (const [size, maxFlavors] of [['Média', 2], ['Grande', 3], ['Família', 4]]) {
+        openPizzaFlavorPicker(size, 65);
+        assert.equal(context.pizzaFlavorSelection.size, size);
+        assert.equal(context.pizzaFlavorSelection.maxFlavors, maxFlavors);
+        assert.equal(context.pizzaFlavorSelection.selectedIds.size, 0);
+    }
+});
+
+test('online menu shows pizza sizes first and opens the flavor menu only after size selection', () => {
+    assert.match(onlineMenuHtml, /id="menuGrid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3"/);
+    const elements = {
+        searchInput: { value: '' },
+        menuGrid: { innerHTML: '' },
+        pizzaFlavorModal: { classList: { remove() {}, add() {} } },
+        pizzaFlavorTitle: { textContent: '' },
+        pizzaFlavorHint: { textContent: '' },
+        pizzaFlavorOptions: { innerHTML: '' },
+        pizzaFlavorConfirm: { disabled: false, textContent: '' }
+    };
+    const context = {
+        MENU_DATA: [
+            { id: 1, name: 'Calabresa', category: 'tradicional', desc: 'Calabresa e cebola.' },
+            { id: 2, name: 'Frango com Catupiry', category: 'tradicional', desc: 'Frango e catupiry.' },
+            { id: 101, name: 'Batata Frita', category: 'petisco', desc: 'Porção crocante.', fixedPrice: 25 },
+            { id: 201, name: 'Refrigerante Lata', category: 'bebida', desc: '350ml.', fixedPrice: 6 }
+        ],
+        currentCategory: 'all',
+        isPromoDayActive: false,
+        pizzaFlavorSelection: null,
+        document: { getElementById: id => elements[id] }
+    };
+    context.getAvailablePizzaFlavors = extractOnlineMenuFunction(
+        '        function getAvailablePizzaFlavors(',
+        '        // RENDER COMPLETE MENU',
+        'getAvailablePizzaFlavors',
+        context
+    );
+    context.renderPizzaFlavorOptions = extractOnlineMenuFunction(
+        '        function renderPizzaFlavorOptions(',
+        '        function togglePizzaFlavor(',
+        'renderPizzaFlavorOptions',
+        context
+    );
+    const renderMenu = extractOnlineMenuFunction(
+        '        function renderMenu(',
+        '        // FILTER CATEGORY',
+        'renderMenu',
+        context
+    );
+    const openPizzaFlavorPicker = extractOnlineMenuFunction(
+        '        function openPizzaFlavorPicker(',
+        '        function renderPizzaFlavorOptions(',
+        'openPizzaFlavorPicker',
+        context
+    );
+
+    renderMenu();
+    assert.match(elements.menuGrid.innerHTML, /Pizza Média/);
+    assert.match(elements.menuGrid.innerHTML, /Pizza Grande/);
+    assert.match(elements.menuGrid.innerHTML, /Pizza Família/);
+    assert.doesNotMatch(elements.menuGrid.innerHTML, /Calabresa|Frango com Catupiry/);
+    assert.match(elements.menuGrid.innerHTML, /Batata Frita/);
+    assert.match(elements.menuGrid.innerHTML, /Refrigerante Lata/);
+    assert.doesNotMatch(elements.menuGrid.innerHTML, /<img\b/);
+    assert.match(elements.menuGrid.innerHTML, /R\$ 25\.00/);
+    assert.match(elements.menuGrid.innerHTML, /Adicionar/);
+
+    openPizzaFlavorPicker('Média', 43);
+    assert.match(elements.pizzaFlavorTitle.textContent, /Pizza Média/);
+    assert.match(elements.pizzaFlavorOptions.innerHTML, /Calabresa/);
+    assert.match(elements.pizzaFlavorOptions.innerHTML, /Frango com Catupiry/);
+    assert.equal(context.pizzaFlavorSelection.selectedIds.size, 0);
+});
+
+test('popular menu flavors are rendered as compact text cards without product images', () => {
+    const popularGrid = { innerHTML: '' };
+    const context = {
+        MENU_DATA: [
+            { id: 1, name: 'Calabresa', desc: 'Calabresa e cebola.', popular: true },
+            { id: 2, name: 'Frango', desc: 'Frango e catupiry.', popular: true }
+        ],
+        document: { getElementById: () => popularGrid }
+    };
+    const renderPopularFlavors = extractOnlineMenuFunction(
+        '        function renderPopularFlavors(',
+        '        function getAvailablePizzaFlavors(',
+        'renderPopularFlavors',
+        context
+    );
+
+    renderPopularFlavors();
+    assert.match(popularGrid.innerHTML, /Calabresa/);
+    assert.match(popularGrid.innerHTML, /Frango/);
+    assert.doesNotMatch(popularGrid.innerHTML, /<img\b/);
+});
+
+test('featured pizza presentation uses the text-card style without a product photo', () => {
+    const heroStart = onlineMenuHtml.indexOf('<!-- HERO IMAGE / FEATURED DISPLAY -->');
+    const heroEnd = onlineMenuHtml.indexOf('<!-- PROMO BANNER SPECIAL SECTION -->', heroStart);
+    assert.notEqual(heroStart, -1);
+    assert.notEqual(heroEnd, -1);
+    const featuredPizza = onlineMenuHtml.slice(heroStart, heroEnd);
+
+    assert.match(featuredPizza, /Pizza Gabryelle Prime/);
+    assert.doesNotMatch(featuredPizza, /<img\b/);
+});
+
+test('online pizza flavor selection cannot exceed its limit and allows fewer flavors', () => {
+    const context = {
+        pizzaFlavorSelection: { size: 'Família', price: 65, maxFlavors: 4, selectedIds: new Set() },
+        renderPizzaFlavorOptions() {}
+    };
+    const togglePizzaFlavor = extractOnlineMenuFunction(
+        '        function togglePizzaFlavor(',
+        '        function closePizzaFlavorPicker(',
+        'togglePizzaFlavor',
+        context
+    );
+    for (const id of [1, 2, 3, 4, 5]) togglePizzaFlavor(id);
+
+    assert.deepEqual([...context.pizzaFlavorSelection.selectedIds], [1, 2, 3, 4]);
+    context.pizzaFlavorSelection = { size: 'Média', price: 43, maxFlavors: 2, selectedIds: new Set([1]) };
+    togglePizzaFlavor(2);
+    togglePizzaFlavor(3);
+    assert.deepEqual([...context.pizzaFlavorSelection.selectedIds], [1, 2]);
+});
+
+test('online pizza is added with exactly the selected flavors, even below the limit', () => {
+    const context = {
+        pizzaFlavorSelection: {
+            size: 'Grande',
+            price: 55,
+            maxFlavors: 3,
+            selectedIds: new Set([2])
+        },
+        MENU_DATA: [
+            { id: 1, name: 'Calabresa', category: 'tradicional' },
+            { id: 2, name: 'Frango com Catupiry', category: 'tradicional' },
+            { id: 3, name: 'Bebida', category: 'bebida' }
+        ],
+        cart: [],
+        closePizzaFlavorPicker() {},
+        updateCartUI() {},
+        showNotification() {},
+        Date,
+        Math
+    };
+    const confirmPizzaFlavors = extractOnlineMenuFunction(
+        '        function confirmPizzaFlavors(',
+        '        function updateCartQuantity(',
+        'confirmPizzaFlavors',
+        context
+    );
+    confirmPizzaFlavors();
+
+    assert.equal(context.cart.length, 1);
+    assert.equal(context.cart[0].size, 'Grande');
+    assert.deepEqual(JSON.parse(JSON.stringify(context.cart[0].flavors)), ['Frango com Catupiry']);
 });
 
 test('online checkout submits directly to the order bridge and tracks status', () => {
@@ -293,10 +590,206 @@ test('inline scripts in the POS and online menu parse successfully', () => {
     }
 });
 
+test('online order staff authorization requires eight-digit privileged PINs', () => {
+    assert.match(orderBridge, /!\/\^\\d\{4,8\}\$\/\.test\(pin\)/);
+    assert.match(orderBridge, /const requiredPinLength = \["ADMIN", "GERENTE", "CAIXA"\]\.includes\(data\?\.role\) \? 8 : 4/);
+    assert.match(orderBridge, /pin\.length !== requiredPinLength/);
+});
+
 test('online menu shows the updated restaurant name and address consistently', () => {
     assert.match(onlineMenuHtml, /<title>Restaurante e Pizzaria Gabryelle/);
     assert.match(onlineMenuHtml, /R\. Treze de Maio, 307/);
     assert.match(onlineMenuHtml, /Itapetinga - BA, 45700-000/);
-    assert.match(onlineMenuHtml, /q=R\.\+Treze\+de\+Maio,\+307,\+Itapetinga,\+BA,\+45700-000/);
+    const restaurantMapsUrl = 'https://www.google.com/maps/place/Pizzaria+e+Churrascaria+Gabryelle/@-15.2553665,-40.2418047,19z/data=!3m1!4b1!4m6!3m5!1s0x7480bf4263ccbf3:0xba0a991b3675f76b!8m2!3d-15.2553678!4d-40.241161!16s%2Fg%2F1ydkj3c9m?entry=ttu&amp;g_ep=EgoyMDI2MTEwOS4wIKXMDSoASAFQAw%3D%3D';
+    const mapsLinks = [...onlineMenuHtml.matchAll(/<a\b[^>]*href="([^"]*google\.com\/maps[^"]*)"[^>]*>/g)]
+        .map(match => match[1]);
+    assert.equal(mapsLinks.length, 2);
+    assert.ok(mapsLinks.every(link => link === restaurantMapsUrl));
     assert.doesNotMatch(onlineMenuHtml, /Avenida Cinquentenário|Dricka Sorvete/);
+});
+
+test('only administrators can clear completed order history', async () => {
+    let toastMessage = '';
+    let saveCount = 0;
+    const state = {
+        orders: [
+            { id: 1, paid: true, status: 'PRONTO', items: [] },
+            { id: 2, paid: false, status: 'PENDENTE', items: [] }
+        ],
+        caixa: { movs: [] },
+        caixaHistory: []
+    };
+    const context = {
+        S: state,
+        isAdmin: () => false,
+        isOrderOpen: order => !order.paid && order.status !== 'CANCELADO',
+        toast: message => { toastMessage = message; },
+        confirm: () => true,
+        renderAll() { throw new Error('Unauthorized action must not render or mutate.'); },
+        save: async () => { saveCount++; return true; }
+    };
+    const limparHistoricoPedidos = extractFunction(
+        '        function limparHistoricoPedidos(',
+        '        function toggleOrderDetails(',
+        'limparHistoricoPedidos',
+        context
+    );
+    await limparHistoricoPedidos();
+
+    assert.equal(state.orders.length, 2);
+    assert.equal(saveCount, 0);
+    assert.match(toastMessage, /Somente o administrador/);
+});
+
+test('admin order history cleanup leaves active orders and persists deletion tombstones', async () => {
+    let saved = false;
+    const context = {
+        S: {
+            orders: [
+                { id: 10, paid: true, status: 'PRONTO', items: [{ name: 'Pizza', qty: 1, price: 20 }] },
+                { id: 11, paid: false, status: 'PENDENTE', items: [] }
+            ],
+            caixa: { movs: [{ type: 'Venda', orderId: 10 }] },
+            caixaHistory: []
+        },
+        isAdmin: () => true,
+        isOrderOpen: order => !order.paid && order.status !== 'CANCELADO',
+        toast() {},
+        confirm: () => true,
+        renderAll() {},
+        save: async () => { saved = true; return true; }
+    };
+    const limparHistoricoPedidos = extractFunction(
+        '        function limparHistoricoPedidos(',
+        '        function toggleOrderDetails(',
+        'limparHistoricoPedidos',
+        context
+    );
+    await limparHistoricoPedidos();
+
+    assert.deepEqual(JSON.parse(JSON.stringify(context.S.orders)), [
+        { id: 11, paid: false, status: 'PENDENTE', items: [] }
+    ]);
+    assert.deepEqual(JSON.parse(JSON.stringify(context.S.deletedOrderHistoryIds)), ['10']);
+    assert.ok(context.S.caixa.movs[0].orderSnapshot);
+    assert.equal(saved, true);
+});
+
+test('cash history cleanup requires administrator and tombstones cleared sessions', async () => {
+    let saved = false;
+    const context = {
+        S: {
+            caixaHistory: [{ id: 'closed-1' }],
+            caixa: { id: 'empty-closed-session', status: 'FECHADO' }
+        },
+        isAdmin: () => true,
+        confirm: () => true,
+        renderAll() {},
+        save: async () => { saved = true; return true; },
+        toast() {}
+    };
+    const limparHistoricoCaixa = extractFunction(
+        '        async function limparHistoricoCaixa(',
+        '        function verCaixaHistorico(',
+        'limparHistoricoCaixa',
+        context
+    );
+    await limparHistoricoCaixa();
+
+    assert.deepEqual(JSON.parse(JSON.stringify(context.S.caixaHistory)), []);
+    assert.deepEqual(JSON.parse(JSON.stringify(context.S.deletedCashHistoryIds)), [
+        'closed-1',
+        'empty-closed-session'
+    ]);
+    assert.equal(saved, true);
+});
+
+test('cash normalization does not re-archive a tombstoned session', () => {
+    const context = {
+        S: {
+            orders: [],
+            clientes: [],
+            deletedOrderHistoryIds: [],
+            deletedCashHistoryIds: ['deleted-session'],
+            caixaHistory: [{ id: 'deleted-session' }],
+            caixa: { id: 'deleted-session', status: 'FECHADO', movs: [], at: '2026-01-01T10:00:00Z' }
+        },
+        formatBrazilPhone: value => value,
+        newCaixa: () => ({ id: 'new-session', status: 'FECHADO', movs: [] }),
+        caixaResumo: () => ({})
+    };
+    const normalizeCaixaState = extractFunction(
+        '        function normalizeCaixaState(',
+        '        function setQzStatus(',
+        'normalizeCaixaState',
+        context
+    );
+    normalizeCaixaState();
+
+    assert.deepEqual(JSON.parse(JSON.stringify(context.S.caixaHistory)), []);
+    assert.equal(context.S.caixa.id, 'new-session');
+});
+
+test('cash normalization keeps empty closed placeholders out of history across reloads', () => {
+    const context = {
+        S: {
+            orders: [],
+            clientes: [],
+            caixaHistory: [],
+            caixa: { id: 'empty-session', status: 'FECHADO', movs: [], at: '2026-01-01T10:00:00Z' }
+        },
+        formatBrazilPhone: value => value,
+        newCaixa: () => ({ id: 'next-empty-session', status: 'FECHADO', movs: [], skipHistoryArchive: true }),
+        caixaResumo: () => ({})
+    };
+    const normalizeCaixaState = extractFunction(
+        '        function normalizeCaixaState(',
+        '        function setQzStatus(',
+        'normalizeCaixaState',
+        context
+    );
+
+    normalizeCaixaState();
+    normalizeCaixaState();
+
+    assert.deepEqual(JSON.parse(JSON.stringify(context.S.caixaHistory)), []);
+});
+
+test('shared state merge retains deletion tombstones and removes stale history', () => {
+    let saveCount = 0;
+    const context = {
+        S: {
+            orders: [],
+            deletedOrderHistoryIds: ['old-order'],
+            deletedCashHistoryIds: ['old-session']
+        },
+        sharedStateSaveCount: 0,
+        sharedStateUpdatedAt: '',
+        DEF: { cats: {} },
+        normalizeCaixaState() {},
+        renderAll() {},
+        updateRolePermissions() {},
+        save() { saveCount++; },
+        scheduleRemoteOrderPrint() {},
+        toast() {}
+    };
+    const applySharedState = extractFunction(
+        '        function applySharedState(',
+        '        function initPrintAgentPresence(',
+        'applySharedState',
+        context
+    );
+
+    applySharedState({
+        updated_at: '2026-11-12T12:00:00.000Z',
+        data: {
+            orders: [{ id: 'old-order', paid: true, status: 'PRONTO' }],
+            caixaHistory: [{ id: 'old-session' }],
+            menu: { cats: {} }
+        }
+    }, true);
+
+    assert.deepEqual(context.S.orders, []);
+    assert.deepEqual(context.S.caixaHistory, []);
+    assert.equal(saveCount, 1);
 });

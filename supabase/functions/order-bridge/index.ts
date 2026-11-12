@@ -66,7 +66,7 @@ async function broadcastOnlineEvent(channelName: string, event: string, payload:
 async function authorizeStaff(body: Record<string, unknown>) {
   const id = body.userId;
   const pin = body.pin;
-  if ((typeof id !== "string" && typeof id !== "number") || typeof pin !== "string" || !/^\d{4}$/.test(pin)) {
+  if ((typeof id !== "string" && typeof id !== "number") || typeof pin !== "string" || !/^\d{4,8}$/.test(pin)) {
     return null;
   }
 
@@ -78,7 +78,8 @@ async function authorizeStaff(body: Record<string, unknown>) {
     .maybeSingle();
 
   if (error) throw error;
-  if (!data || String(data.pin) !== pin || !["ADMIN", "GERENTE", "CAIXA"].includes(data.role)) return null;
+  const requiredPinLength = ["ADMIN", "GERENTE", "CAIXA"].includes(data?.role) ? 8 : 4;
+  if (!data || String(data.pin) !== pin || pin.length !== requiredPinLength) return null;
   return { id: data.id, name: data.name, role: data.role };
 }
 
