@@ -1,0 +1,2 @@
+[functions.order-bridge]
+verify_jwt = false

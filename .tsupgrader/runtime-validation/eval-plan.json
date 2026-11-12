@@ -1,0 +1,30 @@
+{
+  "generatedAt": "2026-11-12T01:10:00-03:00",
+  "generatedOnPlatform": "win32",
+  "projectType": "webapp",
+  "setup": [],
+  "assertions": [
+    {
+      "name": "tests-pass",
+      "kind": "process",
+      "command": "npm",
+      "args": ["test"],
+      "verificationMethod": "test-results",
+      "expected": "0",
+      "timeoutSeconds": 120
+    },
+    {
+      "name": "print-settings-page-served",
+      "kind": "http-probe",
+      "startCommand": "node",
+      "startArgs": [
+        "-e",
+        "require('node:http').createServer((req,res)=>require('node:fs').createReadStream('index.html').pipe(res)).listen(4173,'127.0.0.1')"
+      ],
+      "url": "http://127.0.0.1:4173/",
+      "verificationMethod": "output-contains",
+      "expected": "Configuração de impressão",
+      "timeoutSeconds": 30
+    }
+  ]
+}
