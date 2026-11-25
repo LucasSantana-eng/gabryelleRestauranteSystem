@@ -140,6 +140,61 @@ test('accepted online orders print on the remote agent even when normal auto-pri
     assert.equal(printCount, 1);
 });
 
+test('new table and counter orders print only production; delivery and pickup also print cashier copies', async () => {
+    const printed = [];
+    const context = {
+        printCopyCount: () => 1,
+        printThermal: async (type, id) => { printed.push([id, type]); return true; },
+        toast: message => { throw new Error(message); }
+    };
+    const printBothThermal = extractFunction(
+        '        async function printBothThermal(',
+        '        async function testConfiguredPrinter(',
+        'printBothThermal',
+        context
+    );
+    for (const order of [
+        { id: 1, type: 'MESA' },
+        { id: 2, type: 'BALCAO' },
+        { id: 3, type: 'DELIVERY' },
+        { id: 4, type: 'BALCAO', serviceType: 'RETIRADA' }
+    ]) {
+        assert.equal(await printBothThermal(order), true);
+    }
+    assert.deepEqual(printed, [
+        [1, 'kitchen'], [2, 'kitchen'],
+        [3, 'kitchen'], [3, 'caixa'],
+        [4, 'kitchen'], [4, 'caixa']
+    ]);
+});
+
+test('online pickup remains identified as pickup when imported into the POS', async () => {
+    let imported;
+    const context = {
+        S: { orders: [], menu: { svc: 10 } },
+        KEY: 'state',
+        localStorage: { setItem() {} },
+        supabaseClient: { from: () => ({ upsert: async () => ({ error: null }) }) },
+        sharedStateSaveCount: 0,
+        shouldDelegateAcceptedOnlinePrint: () => false,
+        formatBrazilPhone: value => value || '',
+        finalize: order => { imported = order; return order; },
+        callOrderBridge: async () => {}
+    };
+    const importOrder = extractFunction(
+        '        async function importAcceptedOnlineOrder(',
+        '        function switchTab(',
+        'importAcceptedOnlineOrder',
+        context
+    );
+    await importOrder({
+        id: 'pickup-1',
+        payload: { deliveryType: 'pickup', items: [{ name: 'Pizza', qty: 1, price: 20 }] }
+    });
+    assert.equal(imported.type, 'BALCAO');
+    assert.equal(imported.serviceType, 'RETIRADA');
+});
+
 test('accepting an online order starts local printing before synchronization completes', async () => {
     let resolveImport;
     let markPrintStarted;
@@ -292,6 +347,148 @@ test('table preview without a connected printer is reported instead of pretendin
     );
     assert.equal(await printTablePreview({ id: 1 }), false);
     assert.match(messages[0], /não impressa/);
+});
+
+test('table number is prominent on production and preview receipts without changing delivery headers', async () => {
+    const context = {
+        thermalBrandMarkup: async () => '',
+        where: order => order.type === 'DELIVERY' ? 'Delivery' : `Mesa ${order.mesa}`,
+        esc: value => String(value),
+        money: value => String(value),
+        S: { menu: { ac: [] } },
+        qzSettings: {
+            layoutDensity: 'compact',
+            options: {},
+            kitchenMessage: '',
+            standardMessage: '',
+            tableMessage: ''
+        },
+        tkEnd: '',
+        window: {}
+    };
+    const thermalMarkup = extractFunction(
+        '        async function thermalMarkup(',
+        '        async function printThermal(',
+        'thermalMarkup',
+        context
+    );
+    const tableOrder = {
+        id: 8, type: 'MESA', mesa: 12, at: Date.now(),
+        items: [{ name: 'Pizza', qty: 1, price: 30, det: [] }], total: 30
+    };
+
+    for (const [type, order] of [
+        ['kitchen', tableOrder],
+        ['caixa', { ...tableOrder, accountPreview: true }]
+    ]) {
+        const markup = await thermalMarkup(type, order);
+        assert.match(markup, /<div class="tk-c tk-table-number">MESA: 12<\/div>/);
+        assert.match(markup, /PEDIDO: #8/);
+    }
+    const delivery = await thermalMarkup('caixa', { ...tableOrder, type: 'DELIVERY' });
+    assert.doesNotMatch(delivery, /tk-table-number/);
+    assert.match(delivery, /<span>DELIVERY<\/span>/);
+    const adjusted = await thermalMarkup('caixa', {
+        ...tableOrder, accountPreview: true, removedService: 3, discount: 5, total: 25
+    });
+    assert.match(adjusted, /Serviço removido/);
+    assert.match(adjusted, /Desconto/);
+    assert.match(adjusted, /TOTAL DA CONTA<\/span><span>25<\/span>/);
+});
+
+test('table adjustments remove service and distribute discounts in cents across orders', () => {
+    const calculate = extractFunction(
+        '        function calculateTableAdjustments(',
+        '        function createMesaBill(',
+        'calculateTableAdjustments',
+        {}
+    );
+    const orders = [{ total: 55, svc: 5 }, { total: 22, svc: 2 }];
+    const result = calculate(orders, '50.01', true);
+    assert.equal(result.totalCents, 1999);
+    assert.deepEqual(Array.from(result.discounts), [5000, 1]);
+    assert.match(calculate(orders, '70.01', true).error, /ultrapassar/);
+    assert.match(calculate(orders, '-1', false).error, /válido/);
+    assert.match(calculate(orders, '1.001', false).error, /válido/);
+    assert.equal(calculate(orders, '70', true).totalCents, 0);
+});
+
+test('closing a table persists adjustments and payment allocations including a fully discounted order', () => {
+    const orders = [
+        { id: 1, type: 'MESA', mesa: 2, total: 55, svc: 5, sub: 50, items: [] },
+        { id: 2, type: 'MESA', mesa: 2, total: 22, svc: 2, sub: 20, items: [] }
+    ];
+    const context = {
+        S: { orders, caixa: { movs: [] } },
+        PAYS: ['Dinheiro', 'PIX'],
+        pendingPaymentTarget: { mesaNumber: 2, orderIds: ['1', '2'] },
+        caixaAberto: () => true,
+        mesaOrders: () => orders,
+        isOrderOpen: order => !order.paid,
+        where: () => 'Mesa 2',
+        money: value => String(value),
+        closePaymentModal() {},
+        renderAll() {},
+        toast() {},
+        $: id => {
+            if (id === 'table-discount') return { value: '50' };
+            if (id === 'table-remove-service') return { checked: true };
+            if (id === 'payment-lines') return {
+                querySelectorAll: () => [{
+                    querySelector: selector => ({ value: selector === 'select' ? 'PIX' : '20' })
+                }]
+            };
+            throw new Error(`Unexpected element ${id}`);
+        }
+    };
+    extractFunction('        function calculateTableAdjustments(', '        function createMesaBill(', 'calculateTableAdjustments', context);
+    extractFunction('        function calculatePaymentAmounts(', '        function readPaymentDraft(', 'calculatePaymentAmounts', context);
+    extractFunction('        function readPaymentDraft(', '        function updateTablePaymentAdjustments(', 'readPaymentDraft', context);
+    const confirm = extractFunction('        function confirmOrderPayment(', '        function cancelOrder(', 'confirmOrderPayment', context);
+    confirm();
+    assert.equal(orders[0].total, 0);
+    assert.equal(orders[0].discount, 50);
+    assert.equal(orders[0].removedService, 5);
+    assert.equal(orders[1].total, 20);
+    assert.equal(orders[1].svc, 0);
+    assert.equal(context.S.caixa.movs.reduce((sum, movement) => sum + movement.v, 0), 20);
+    assert.equal(context.S.caixa.movs.length, 2);
+});
+
+test('a table can be fully discounted and closed without a payment', () => {
+    const orders = [{ id: 1, type: 'MESA', mesa: 2, total: 22, svc: 2, items: [] }];
+    const context = {
+        S: { orders, caixa: { movs: [] } },
+        PAYS: ['Dinheiro'],
+        pendingPaymentTarget: { mesaNumber: 2, orderIds: ['1'] },
+        caixaAberto: () => true,
+        mesaOrders: () => orders,
+        isOrderOpen: order => !order.paid,
+        where: () => 'Mesa 2',
+        money: value => String(value),
+        closePaymentModal() {},
+        renderAll() {},
+        toast() {},
+        $: id => {
+            if (id === 'table-discount') return { value: '20' };
+            if (id === 'table-remove-service') return { checked: true };
+            if (id === 'payment-lines') return {
+                querySelectorAll: () => [{
+                    querySelector: selector => ({ value: selector === 'select' ? 'Dinheiro' : '0' })
+                }]
+            };
+            throw new Error(`Unexpected element ${id}`);
+        }
+    };
+    extractFunction('        function calculateTableAdjustments(', '        function createMesaBill(', 'calculateTableAdjustments', context);
+    extractFunction('        function calculatePaymentAmounts(', '        function readPaymentDraft(', 'calculatePaymentAmounts', context);
+    extractFunction('        function readPaymentDraft(', '        function updateTablePaymentAdjustments(', 'readPaymentDraft', context);
+    const confirm = extractFunction('        function confirmOrderPayment(', '        function cancelOrder(', 'confirmOrderPayment', context);
+    confirm();
+    assert.equal(orders[0].paid, true);
+    assert.equal(orders[0].total, 0);
+    assert.equal(orders[0].discount, 20);
+    assert.equal(context.S.caixa.movs[0].v, 0);
 });
 
 test('table preview asks for printer presence and waits for a response before sending', async () => {

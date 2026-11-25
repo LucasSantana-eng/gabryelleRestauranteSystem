@@ -52,6 +52,7 @@
         .tk-logo { display: block; width: 38mm; max-width: 100%; height: auto; margin: 0 auto 2mm; }
         .tk-brand { color: #000; -webkit-text-fill-color: #000; font-size: 16px; font-weight: 900; letter-spacing: .3px; }
         .tk-num { font-size: 34px; font-weight: 900; line-height: 1.1; }
+        .tk-table-number { font-size: 22px; font-weight: 900; line-height: 1.1; }
         .tk-hr { border-top: 1px dashed #000; margin: 5px 0; } .tk-hr2 { border-top: 2px solid #000; margin: 5px 0; }
         .tk-row { display: flex; justify-content: space-between; gap: 6px; }
         .tk-meta { font-size: 12px; font-weight: 700; }
@@ -539,7 +540,7 @@
                 <div class="bg-dark-card p-4 rounded-xl border border-dark-border space-y-4">
                     <div>
                         <h3 class="font-bold text-sm text-white">Configurações das impressões</h3>
-                        <p class="text-xs text-gray-400 mt-1">Defina a quantidade de vias padrão e de produção para cada tipo de pedido.</p>
+                        <p class="text-xs text-gray-400 mt-1">Defina a quantidade de vias padrão e de produção para cada tipo de pedido. Ao lançar pedidos de mesa ou balcão, imprime-se apenas a produção; a via da mesa é impressa ao fechar a conta.</p>
                     </div>
                     <div id="qz-copy-settings" class="grid grid-cols-1 xl:grid-cols-2 gap-4"></div>
                 </div>
@@ -767,6 +768,13 @@
             </div>
             <div class="flex justify-between rounded-lg border border-dark-border bg-dark-bg p-3 text-sm font-bold text-white">
                 <span>Total a pagar</span><span id="payment-modal-total" class="text-gold-400"></span>
+            </div>
+            <div id="table-payment-adjustments" class="hidden space-y-3 rounded-lg border border-dark-border p-3 text-xs">
+                <label class="block text-gray-300">Desconto (R$)
+                    <input id="table-discount" type="number" min="0" step="0.01" inputmode="decimal" value="0" oninput="updateTablePaymentAdjustments()" class="mt-1 w-full rounded-lg border border-dark-border bg-dark-bg p-2 text-sm text-white">
+                </label>
+                <label class="flex items-center gap-2 text-gray-300"><input id="table-remove-service" type="checkbox" onchange="updateTablePaymentAdjustments()"> Remover taxa de serviço <span id="table-service-amount"></span></label>
+                <button type="button" onclick="reprintAdjustedTableBill()" class="rounded-lg border border-dark-border px-3 py-2 text-gray-200 hover:border-gold-500">Imprimir pré-conta ajustada</button>
             </div>
             <div id="payment-lines" class="space-y-2"></div>
             <button type="button" onclick="addPaymentLine()" class="rounded-lg border border-dark-border px-3 py-2 text-xs text-gray-200 hover:border-gold-500">+ Adicionar forma de pagamento</button>
@@ -1615,6 +1623,7 @@ R$ 130,00
                 const delegateOnlinePrint = shouldDelegateAcceptedOnlinePrint();
                 const order = {
                     type: payload.deliveryType === 'delivery' ? 'DELIVERY' : 'BALCAO',
+                    serviceType: payload.deliveryType === 'pickup' ? 'RETIRADA' : '',
                     mesa: null,
                     cli: String(customer.name || 'Cliente online'),
                     tel: formatBrazilPhone(customer.phone),
@@ -3078,7 +3087,27 @@ R$ 130,00
             }
             openPaymentModal([order]);
         }
-        function createMesaBill(mesaNumber, orders) {
+        function calculateTableAdjustments(orders, discountValue, removeService) {
+            const discount = Number(discountValue);
+            if (!Number.isFinite(discount) || discount < 0 || !/^\d+(?:\.\d{1,2})?$/.test(String(discountValue))) {
+                return { error: 'Informe um desconto válido em reais, com até duas casas decimais.' };
+            }
+            const discountCents = Math.round(discount * 100);
+            const balances = orders.map(order => Math.round(Number(order.total || 0) * 100)
+                - (removeService ? Math.round(Number(order.svc || 0) * 100) : 0));
+            const totalCents = balances.reduce((sum, value) => sum + value, 0);
+            if (balances.some(value => value < 0) || discountCents > totalCents) {
+                return { error: 'O desconto não pode ultrapassar o total da conta.' };
+            }
+            let remaining = discountCents;
+            const discounts = balances.map(balance => {
+                const applied = Math.min(balance, remaining);
+                remaining -= applied;
+                return applied;
+            });
+            return { totalCents: totalCents - discountCents, discounts };
+        }
+        function createMesaBill(mesaNumber, orders, adjustments = null) {
             const items = orders.flatMap(order => order.items || []);
             const subtotal = +orders.reduce((sum, order) => sum + Number(order.sub ??
                 (order.items || []).reduce((itemSum, item) => itemSum + (Number(item.qty) || 0) * (Number(item.price) || 0), 0)), 0).toFixed(2);
@@ -3092,8 +3121,10 @@ R$ 130,00
                 items,
                 sub: subtotal,
                 taxa,
-                svc: service,
-                total: +orders.reduce((sum, order) => sum + Number(order.total || 0), 0).toFixed(2),
+                svc: adjustments?.removeService ? 0 : service,
+                removedService: adjustments?.removeService ? service : 0,
+                discount: adjustments ? adjustments.discounts.reduce((sum, value) => sum + value, 0) / 100 : 0,
+                total: adjustments ? adjustments.totalCents / 100 : +orders.reduce((sum, order) => sum + Number(order.total || 0), 0).toFixed(2),
                 paid: false,
                 pay: '',
                 accountPreview: true,
@@ -3109,6 +3140,11 @@ R$ 130,00
                 mesaNumber
             };
             const total = openOrders.reduce((sum, order) => sum + Number(order.total || 0), 0);
+            $('table-payment-adjustments').classList.toggle('hidden', mesaNumber === null);
+            $('table-discount').value = '0';
+            $('table-remove-service').checked = false;
+            $('table-service-amount').textContent = `(${money(openOrders.reduce((sum, order) => sum + Number(order.svc || 0), 0))})`;
+            pendingPaymentTarget.lastTotal = total;
             $('payment-modal-title').textContent = mesaNumber === null ? 'Receber pagamento' : `Fechar conta da Mesa ${mesaNumber}`;
             $('payment-modal-context').textContent = mesaNumber === null
                 ? `Pedido #${openOrders[0].id}`
@@ -3149,9 +3185,9 @@ R$ 130,00
             });
             updatePaymentPreview();
         }
-        function calculatePaymentAmounts(total, lines) {
+        function calculatePaymentAmounts(total, lines, allowZero = false) {
             const totalCents = Math.round(Number(total) * 100);
-            if (!Number.isFinite(totalCents) || totalCents <= 0) return { error: 'O total da conta precisa ser maior que zero.' };
+            if (!Number.isFinite(totalCents) || totalCents < 0 || (!allowZero && totalCents === 0)) return { error: 'O total da conta precisa ser maior que zero.' };
             let cashReceivedCents = 0;
             let otherPaymentsCents = 0;
             const requestedPayments = [];
@@ -3189,18 +3225,45 @@ R$ 130,00
                 method: line.querySelector('select').value,
                 amount: line.querySelector('input').value
             }));
-            const total = pendingPaymentTarget?.mesaNumber === null
-                ? S.orders.find(order => String(order.id) === pendingPaymentTarget?.orderIds[0] && isOrderOpen(order))?.total
-                : mesaOrders(pendingPaymentTarget?.mesaNumber).reduce((sum, order) => sum + Number(order.total || 0), 0);
-            return { total: Number(total), result: calculatePaymentAmounts(total, lines) };
+            if (pendingPaymentTarget?.mesaNumber === null) {
+                const total = S.orders.find(order => String(order.id) === pendingPaymentTarget?.orderIds[0] && isOrderOpen(order))?.total;
+                return { total: Number(total), result: calculatePaymentAmounts(total, lines) };
+            }
+            const orders = mesaOrders(pendingPaymentTarget?.mesaNumber);
+            const removeService = $('table-remove-service').checked;
+            const adjustments = calculateTableAdjustments(orders, $('table-discount').value, removeService);
+            if (adjustments.error) return { total: NaN, result: { error: adjustments.error } };
+            adjustments.removeService = removeService;
+            return { total: adjustments.totalCents / 100, result: calculatePaymentAmounts(adjustments.totalCents / 100, lines, true), adjustments };
+        }
+        function updateTablePaymentAdjustments() {
+            if (!pendingPaymentTarget || pendingPaymentTarget.mesaNumber === null) return;
+            const draft = readPaymentDraft();
+            const lines = [...$('payment-lines').querySelectorAll('[data-payment-line]')];
+            if (Number.isFinite(draft.total) && lines.length === 1) {
+                const input = lines[0].querySelector('input');
+                if (Math.round(Number(input.value) * 100) === Math.round(pendingPaymentTarget.lastTotal * 100)) {
+                    input.value = draft.total.toFixed(2);
+                }
+                pendingPaymentTarget.lastTotal = draft.total;
+            }
+            updatePaymentPreview();
+        }
+        function reprintAdjustedTableBill() {
+            if (!pendingPaymentTarget || pendingPaymentTarget.mesaNumber === null) return;
+            const orders = mesaOrders(pendingPaymentTarget.mesaNumber);
+            if (!orders.length) return toast('Esta mesa não possui pedidos em aberto.');
+            const draft = readPaymentDraft();
+            if (!draft.adjustments) return toast(draft.result.error);
+            printTablePreview(createMesaBill(pendingPaymentTarget.mesaNumber, orders, draft.adjustments));
         }
         function updatePaymentPreview() {
             if (!pendingPaymentTarget || !$('payment-modal') || $('payment-modal').classList.contains('hidden')) return;
-            const { result } = readPaymentDraft();
+            const { result, total } = readPaymentDraft();
             const error = result.error || '';
             $('payment-error').textContent = error;
             $('payment-error').classList.toggle('hidden', !error);
-            $('payment-modal-total').textContent = money(readPaymentDraft().total);
+            $('payment-modal-total').textContent = Number.isFinite(total) ? money(total) : '—';
             $('payment-remaining').textContent = Number.isFinite(result.remainingCents)
                 ? money(result.remainingCents / 100) : '—';
             $('payment-change').textContent = Number.isFinite(result.changeCents)
@@ -3223,7 +3286,7 @@ R$ 130,00
                 closePaymentModal();
                 return toast('Os pedidos desta conta já foram pagos ou cancelados.');
             }
-            const { result } = readPaymentDraft();
+            const { result, adjustments } = readPaymentDraft();
             if (result.error) return toast(result.error);
             if (result.remainingCents !== 0) {
                 $('payment-error').textContent = `Ainda falta ${money(result.remainingCents / 100)} para completar a conta.`;
@@ -3231,7 +3294,9 @@ R$ 130,00
                 return;
             }
             const payments = result.payments;
-            const orderBalances = orders.map(order => Math.round(Number(order.total || 0) * 100));
+            const orderBalances = orders.map((order, index) => Math.round(Number(order.total || 0) * 100)
+                - (adjustments?.removeService ? Math.round(Number(order.svc || 0) * 100) : 0)
+                - (adjustments?.discounts[index] || 0));
             const allocations = orders.map(() => payments.map(() => 0));
             let allocationFailed = false;
             payments.forEach((payment, paymentIndex) => {
@@ -3252,6 +3317,16 @@ R$ 130,00
                     method: payment.method,
                     amount: allocations[orderIndex][paymentIndex] / 100
                 })).filter(payment => payment.amount > 0);
+                if (adjustments) {
+                    if (adjustments.removeService) {
+                        order.removedService = Number(order.svc || 0);
+                        order.svc = 0;
+                    }
+                    order.discount = adjustments.discounts[orderIndex] / 100;
+                    order.total = (Math.round(Number(order.total || 0) * 100)
+                        - (adjustments.removeService ? Math.round(Number(order.removedService || 0) * 100) : 0)
+                        - adjustments.discounts[orderIndex]) / 100;
+                }
                 order.paid = true;
                 order.pay = orderPayments.map(payment => payment.method).join(' + ');
                 order.paymentDetails = orderPayments;
@@ -3259,6 +3334,7 @@ R$ 130,00
                 order.paidAt = timestamp;
                 order.status = 'PRONTO';
                 order.readyAt = timestamp;
+                if (!orderPayments.length && order.total === 0) orderPayments.push({ method: '', amount: 0 });
                 orderPayments.forEach(payment => {
                     const movement = {
                         t: timestamp,
@@ -3336,6 +3412,8 @@ R$ 130,00
                             <div class="flex justify-between"><span>Subtotal</span><span>${money(o.sub ?? (o.items || []).reduce((sum, item) => sum + (Number(item.qty) || 0) * (Number(item.price) || 0), 0))}</span></div>
                             ${o.taxa ? `<div class="flex justify-between"><span>Taxa de entrega</span><span>${money(o.taxa)}</span></div>` : ''}
                             ${o.svc ? `<div class="flex justify-between"><span>Serviço</span><span>${money(o.svc)}</span></div>` : ''}
+                            ${o.removedService ? `<div class="flex justify-between"><span>Serviço removido</span><span>${money(o.removedService)}</span></div>` : ''}
+                            ${o.discount ? `<div class="flex justify-between"><span>Desconto</span><span>- ${money(o.discount)}</span></div>` : ''}
                             <div class="flex justify-between font-bold text-white"><span>Total</span><span class="text-gold-400">${money(o.total)}</span></div>
                             <div class="flex justify-between"><span>Pagamento</span><span>${esc(o.paid ? o.pay : o.payPref || 'A receber')}</span></div>
                             ${o.paid && o.change ? `<div class="flex justify-between"><span>Troco</span><span>${money(o.change)}</span></div>` : ''}
@@ -3365,6 +3443,8 @@ R$ 130,00
                     total: order.total,
                     taxa: order.taxa,
                     svc: order.svc,
+                    removedService: order.removedService,
+                    discount: order.discount,
                     items: order.items,
                     by: order.by
                 }))
@@ -3520,6 +3600,7 @@ R$ 130,00
                 attendants: {}
             };
 
+            const countedOrders = new Set();
             sales.forEach(m => {
                 const orderId = m.orderId || Number((m.desc || '').match(/Pedido Nº (\d+)/)?.[1]);
                 const order = S.orders.find(o => o.id === orderId) || m.orderSnapshot;
@@ -3530,10 +3611,15 @@ R$ 130,00
                 const pay = m.pay || order.pay;
                 const category = type === 'DELIVERY' ? summary.delivery : type === 'MESA' ? summary.tables : summary.counter;
                 category.total += amount;
-                category.products += products;
                 if (category.byPayment[pay] !== undefined) category.byPayment[pay] += amount;
-                if (type === 'DELIVERY') category.deliveryFee += Number(order.taxa || 0);
-                category.serviceFee += Number(order.svc || 0);
+                const orderKey = String(orderId);
+                if (!countedOrders.has(orderKey)) {
+                    countedOrders.add(orderKey);
+                    category.products += products;
+                    if (type === 'DELIVERY') category.deliveryFee += Number(order.taxa || 0);
+                    category.serviceFee += Number(order.svc || 0);
+                    category.discount = (category.discount || 0) + Number(order.discount || 0);
+                }
                 const attendant = order.by || m.by || 'Não informado';
                 summary.attendants[attendant] = (summary.attendants[attendant] || 0) + amount;
             });
@@ -3553,7 +3639,7 @@ R$ 130,00
             const summary = c.summary || caixaResumo(c);
             const row = (label, value, cls = 'text-gray-300') => `<div class="flex justify-between gap-3 ${cls}"><span>${label}</span><span class="font-medium text-right">${value}</span></div>`;
             const methodRows = obj => PAYS.map(pay => row(esc(pay), money(obj.byPayment[pay] || 0))).join('');
-            const category = (title, data, includeFee) => `<div class="space-y-1.5 border-t border-dark-border pt-3"><h4 class="text-[11px] font-bold uppercase tracking-wider text-gray-400">${title}</h4>${methodRows(data)}${row('Valor dos produtos', money(data.products))}${includeFee ? row('Taxa de entrega', money(data.deliveryFee)) : ''}${data.serviceFee ? row('Serviço', money(data.serviceFee)) : ''}${row('Total', money(data.total), 'font-bold text-white')}</div>`;
+            const category = (title, data, includeFee) => `<div class="space-y-1.5 border-t border-dark-border pt-3"><h4 class="text-[11px] font-bold uppercase tracking-wider text-gray-400">${title}</h4>${methodRows(data)}${row('Valor dos produtos', money(data.products))}${includeFee ? row('Taxa de entrega', money(data.deliveryFee)) : ''}${data.serviceFee ? row('Serviço', money(data.serviceFee)) : ''}${data.discount ? row('Descontos', '- ' + money(data.discount)) : ''}${row('Total', money(data.total), 'font-bold text-white')}</div>`;
             const attendants = Object.entries(summary.attendants).sort((a, b) => b[1] - a[1]).map(([name, value]) => row(esc(name), money(value))).join('') || '<p class="text-xs text-gray-500">Sem vendas por atendente.</p>';
             const withdrawal = Number(c.withdrawal || 0);
             const remaining = c.remainingCash === undefined ? summary.drawerCash : Number(c.remainingCash);
@@ -3825,7 +3911,8 @@ R$ 130,00
             const d = new Date(o.at), dt = d.toLocaleDateString('pt-BR') + ' ' + d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
             const brand = await thermalBrandMarkup();
             const location = o.type === 'MESA' ? `MESA: ${o.mesa}` : where(o).toUpperCase();
-            const top = (t) => `${brand}<div class="tk-hr2"></div><div class="tk-c tk-b">${t}</div><div class="tk-hr"></div><div class="tk-row tk-meta"><span>PEDIDO: #${o.id}</span><span>${esc(location)}</span></div><div class="tk-meta">DATA: ${dt}</div><div class="tk-meta">ATENDENTE: ${esc(o.by || '')}</div><div class="tk-hr"></div>`;
+            const tableLocation = o.type === 'MESA' ? `<div class="tk-c tk-table-number">${esc(location)}</div>` : '';
+            const top = (t) => `${brand}<div class="tk-hr2"></div><div class="tk-c tk-b">${t}</div><div class="tk-hr"></div>${tableLocation}<div class="tk-row tk-meta"><span>PEDIDO: #${o.id}</span>${tableLocation ? '' : `<span>${esc(location)}</span>`}</div><div class="tk-meta">DATA: ${dt}</div><div class="tk-meta">ATENDENTE: ${esc(o.by || '')}</div><div class="tk-hr"></div>`;
             const messageMarkup = message => String(message || '').split(/\r?\n/)
                 .map(line => line.trim()).filter(Boolean)
                 .map(line => `<div>${esc(line)}</div>`).join('');
@@ -3875,11 +3962,13 @@ R$ 130,00
                     ? (o.taxa ? `<div class="tk-row"><span>Taxa de entrega</span><span>${money(o.taxa)}</span></div>` : '')
                         + (o.svc ? `<div class="tk-row"><span>${o.accountPreview ? 'Taxa de serviço' : `Taxa de serviço (${o.svcPct || 10}%)`}</span><span>${money(o.svc)}</span></div>` : '')
                     : '';
+                const adjustmentMarkup = (o.removedService ? `<div class="tk-row"><span>Serviço removido</span><span>${money(o.removedService)}</span></div>` : '')
+                    + (o.discount ? `<div class="tk-row"><span>Desconto</span><span>- ${money(o.discount)}</span></div>` : '');
                 h = top(type === 'cancel' ? 'COMPROVANTE DE CANCELAMENTO' : o.accountPreview ? 'PRÉ-CONTA DA MESA' : 'COMANDA GERAL') + orderRefs + cli
                   + '<div class="tk-c tk-b">ITENS DA COMANDA</div><div class="tk-hr"></div>'
                   + itemMarkup
                   + '<div class="tk-hr2"></div><div class="tk-b">RESUMO DA CONTA</div>'
-                  + subtotalMarkup + feesMarkup
+                  + subtotalMarkup + feesMarkup + adjustmentMarkup
                   + `<div class="tk-hr2"></div><div class="tk-row tk-tot"><span>${type === 'cancel' ? 'VALOR CANCELADO' : o.accountPreview ? 'TOTAL DA CONTA' : 'TOTAL'}</span><span>${money(o.total)}</span></div><div class="tk-hr2"></div><div class="tk-c tk-b">${type === 'cancel' ? 'PEDIDO CANCELADO' : pay}</div>${tableMessage ? `<div class="tk-hr"></div><div class="tk-c tk-sm">${messageMarkup(tableMessage)}</div>` : '<div class="tk-hr"></div><div class="tk-c tk-sm">Obrigado pela preferência!</div>'}`;
             }
             const qrValue = type !== 'kitchen' && qzSettings.options.printQrCode
@@ -3934,9 +4023,10 @@ R$ 130,00
         }
         async function printBothThermal(order) {
             const productionCopies = printCopyCount('kitchen', order);
-            const standardCopies = printCopyCount('caixa', order);
+            const standardCopies = order.type === 'DELIVERY' || order.serviceType === 'RETIRADA'
+                ? printCopyCount('caixa', order) : 0;
             if (!productionCopies && !standardCopies) {
-                toast('Configure ao menos uma via de produção ou padrão para este tipo de pedido.');
+                toast('Configure ao menos uma via disponível para impressão deste tipo de pedido.');
                 return false;
             }
             const results = await Promise.all([
