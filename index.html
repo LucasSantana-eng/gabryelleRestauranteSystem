@@ -3,13 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Restaurante e Pizzaria Gabryelle - Sistema de Gestão & PDV</title>
+    <title>Gabryelle Prime - Sistema de Gestão & PDV</title>
     
     <!-- Meta tags PWA para Android & iOS (Modo App / Tela Cheia) -->
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="Gabryelle PDV">
+    <meta name="apple-mobile-web-app-title" content="Gabryelle Prime">
     <meta name="theme-color" content="#121214">
     
     <!-- Tailwind CSS CDN -->
@@ -161,7 +161,7 @@
                     <i data-lucide="pizza" class="w-5 h-5 text-gold-500"></i>
                 </div>
                 <div>
-                    <h1 class="font-bold text-sm leading-none tracking-wide text-white">RESTAURANTE E PIZZARIA GABRYELLE</h1>
+                    <h1 class="font-bold text-sm leading-none tracking-wide text-white">GABRYELLE PRIME</h1>
                     <span class="text-[10px] text-gold-500 tracking-wider">MUSIC & GASTRONOMIA</span>
                 </div>
             </div>
@@ -820,8 +820,8 @@
 
     <!-- JAVASCRIPT LOGIC INTEGRADA AO SUPABASE -->
     <script>
-        const SUPABASE_URL = 'https://ciousuoedyezkltyfvqb.supabase.co';
-        const SUPABASE_KEY = 'sb_publishable_hts4YS3W97DfKWQQSq3XAw_zdgtNteA';
+        const SUPABASE_URL = 'https://yptzvzsygubopgpoewng.supabase.co';
+        const SUPABASE_KEY = 'sb_publishable_9p-2raPKvQFSYsYEk1LtzA_xsJ9nYMe';
 
         let supabaseInitError = null;
         // Inicialização única e segura do cliente Supabase para evitar redeclarações
@@ -862,12 +862,7 @@
             alert(`${action}.\n\nO banco de dados não confirmou a operação: ${message}`);
         }
 
-        // Usuários padrão (com Lucas configurado como ADMIN e PIN 1644)
-        let users = [
-            { id: 1, name: 'Lucas', role: 'ADMIN', pin: '1644', active: true },
-            { id: 2, name: 'Karine (Garçom)', role: 'GARCOM', pin: '2222', active: true },
-            { id: 3, name: 'William (Caixa)', role: 'CAIXA', pin: '3333', active: true }
-        ];
+        let users = [];
 
         let currentUser = null;
         const ORDER_BRIDGE_URL = `${SUPABASE_URL}/functions/v1/order-bridge`;
@@ -1970,7 +1965,7 @@ R$ 130,00
             }
         };
         const TABLE_COUNT = 50;
-        const KEY = 'gp_state_v1';
+        const KEY = `gp_state_v1:${SUPABASE_URL}`;
         let S; try { S = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { S = {}; }
         S.menu = S.menu || JSON.parse(JSON.stringify(DEF));
         S.menu.cats = S.menu.cats && typeof S.menu.cats === 'object' ? S.menu.cats : {};
@@ -2799,7 +2794,6 @@ R$ 130,00
         normalizeCaixaState();
 
         function initApp() {
-            try { const su = JSON.parse(localStorage.getItem('gp_users')); if (su && su.length) users = su; } catch (e) {}
             $('print-agent-token').value = printAgentToken;
             $('o-mesa').innerHTML = Array.from({ length: TABLE_COUNT }, (_, i) => `<option value="${i + 1}">Mesa ${i + 1}</option>`).join('');
             $('o-pay').innerHTML = ['Pagar depois', ...PAYS].map(p => `<option>${p}</option>`).join('');

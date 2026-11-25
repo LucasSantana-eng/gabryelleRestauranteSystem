@@ -35,6 +35,32 @@ function extractOnlineMenuFunction(startMarker, endMarker, exportName, context) 
     return context[exportName];
 }
 
+test('local state is isolated by Supabase project without deleting legacy data', () => {
+    const storage = new Map([
+        ['gp_state_v1', JSON.stringify({ orders: [{ id: 'legacy' }] })],
+        ['gp_state_v1:https://other.supabase.co', JSON.stringify({ orders: [{ id: 'other' }] })],
+        ['gp_state_v1:https://new.supabase.co', JSON.stringify({ orders: [{ id: 'new' }] })]
+    ]);
+    const start = html.indexOf('        const KEY = ');
+    const end = html.indexOf('        const QZ_SETTINGS_KEY = ', start);
+    assert.notEqual(start, -1);
+    assert.notEqual(end, -1);
+    const loadState = url => vm.runInNewContext(
+        `${html.slice(start, end)}\nS;`,
+        {
+            SUPABASE_URL: url,
+            DEF: { cats: {} },
+            localStorage: { getItem: key => storage.get(key) || null },
+            newCaixa: () => ({})
+        }
+    );
+
+    assert.equal(loadState('https://new.supabase.co').orders[0].id, 'new');
+    assert.equal(loadState('https://fresh.supabase.co').orders.length, 0);
+    assert.equal(JSON.parse(storage.get('gp_state_v1')).orders[0].id, 'legacy');
+    assert.equal(JSON.parse(storage.get('gp_state_v1:https://other.supabase.co')).orders[0].id, 'other');
+});
+
 test('category routing lets operators explicitly exclude a category', () => {
     let saves = 0;
     const context = {
@@ -805,8 +831,7 @@ test('online menu navigation uses the requested restaurant name', () => {
         onlineMenuHtml.indexOf('<!-- LOGO -->'),
         onlineMenuHtml.indexOf('<!-- DESKTOP NAV -->')
     );
-    assert.match(header, /Restaurante e Pizzaria Gabryelle/);
-    assert.doesNotMatch(header, /GABRYELLE\s*<span[^>]*>PRIME<\/span>/);
+    assert.match(header, /Gabryelle Prime/);
 });
 
 test('checkout fields use a 16px minimum font size to prevent mobile focus zoom', () => {
@@ -1177,15 +1202,26 @@ test('online order acceptance does not wait for realtime notifications before pr
 });
 
 test('online menu shows the updated restaurant name and address consistently', () => {
-    assert.match(onlineMenuHtml, /<title>Restaurante e Pizzaria Gabryelle/);
-    assert.match(onlineMenuHtml, /R\. Treze de Maio, 307/);
-    assert.match(onlineMenuHtml, /Itapetinga - BA, 45700-000/);
-    const restaurantMapsUrl = 'https://www.google.com/maps/place/Pizzaria+e+Churrascaria+Gabryelle/@-15.2553665,-40.2418047,19z/data=!3m1!4b1!4m6!3m5!1s0x7480bf4263ccbf3:0xba0a991b3675f76b!8m2!3d-15.2553678!4d-40.241161!16s%2Fg%2F1ydkj3c9m?entry=ttu&amp;g_ep=EgoyMDI2MTEwOS4wIKXMDSoASAFQAw%3D%3D';
+    assert.match(html, /<h1[^>]*>GABRYELLE PRIME<\/h1>/);
+    assert.match(onlineMenuHtml, /<title>Gabryelle Prime/);
+    assert.match(onlineMenuHtml, /Av\. Cinquentenário, na Lagoa/);
+    assert.match(onlineMenuHtml, /ao lado da Drika Sorvetes/i);
+    assert.match(onlineMenuHtml, /\(77\) 9 9166-3151/);
+    const restaurantMapsUrl = 'https://www.google.com/maps/search/?api=1&amp;query=Drika%20Sorvetes%2C%20Avenida%20Cinquenten%C3%A1rio%2C%20Itapetinga%20BA';
     const mapsLinks = [...onlineMenuHtml.matchAll(/<a\b[^>]*href="([^"]*google\.com\/maps[^"]*)"[^>]*>/g)]
         .map(match => match[1]);
-    assert.equal(mapsLinks.length, 2);
+    assert.equal(mapsLinks.length, 3);
     assert.ok(mapsLinks.every(link => link === restaurantMapsUrl));
-    assert.doesNotMatch(onlineMenuHtml, /Avenida Cinquentenário|Dricka Sorvete/);
+    assert.doesNotMatch(onlineMenuHtml, /R\. Treze de Maio|Restaurante e Pizzaria Gabryelle/);
+    const whatsappLinks = [...onlineMenuHtml.matchAll(/href="https:\/\/wa\.me\/(\d+)/g)];
+    assert.ok(whatsappLinks.length > 0);
+    assert.ok(whatsappLinks.every(match => match[1] === '5577991663151'));
+});
+
+test('contact page and chatbot both show opening hours from Monday to Sunday', () => {
+    assert.match(onlineMenuHtml, /Segunda a Domingo: 18:00h às 23:30h/);
+    assert.match(onlineMenuHtml, /Atendemos de <strong>Segunda a Domingo<\/strong>, das <strong>18:00h às 23:30h<\/strong>/);
+    assert.doesNotMatch(onlineMenuHtml, /Fechamos apenas nas segundas-feiras/);
 });
 
 test('only administrators can clear completed order history', async () => {

@@ -2,8 +2,8 @@ const { createClient } = require('@supabase/supabase-js');
 const { ThermalPrinter, PrinterTypes, CharacterSet } = require('node-thermal-printer');
 const printerDriver = require('printer');
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://ciousuoedyezkltyfvqb.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_hts4YS3W97DfKWQQSq3XAw_zdgtNteA';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://yptzvzsygubopgpoewng.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_KEY || 'sb_publishable_9p-2raPKvQFSYsYEk1LtzA_xsJ9nYMe';
 const PRINTER_INTERFACE = process.env.PRINTER_INTERFACE || 'printer:\\\\localhost\\Elgin-i9';
 const STATE_ID = 'gp_state';
 const LEGACY_PRINT_SERVICE_ENABLED = process.env.LEGACY_PRINT_SERVICE_ENABLED === 'true';
