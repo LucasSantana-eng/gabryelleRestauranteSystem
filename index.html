@@ -1046,14 +1046,15 @@ R$ 130,00
                     const payload = message.payload;
                     if (typeof payload?.sourceId !== 'string' || typeof payload.connected !== 'boolean'
                         || !Number.isFinite(payload.sentAt)) return;
-                    if (Date.now() - payload.sentAt > PRINT_AGENT_PRESENCE_TIMEOUT_MS
-                        || payload.sentAt > Date.now() + PRINT_AGENT_PRESENCE_HEARTBEAT_MS) return;
                     if (payload.connected) {
-                        printAgentPresenceSources.set(payload.sourceId, payload.sentAt);
+                        printAgentPresenceSources.set(payload.sourceId, Date.now());
                     } else {
                         printAgentPresenceSources.delete(payload.sourceId);
                     }
                     updateQzConnectionIndicator();
+                })
+                .on('broadcast', { event: 'status-request' }, () => {
+                    if (isPrintAgentConnected()) publishPrintAgentPresence(true);
                 })
                 .on('broadcast', { event: 'table-preview' }, message => {
                     if (message.payload?.targetId === PRINT_AGENT_PRESENCE_SOURCE_ID) processTablePreviewPrintJob();
@@ -1294,7 +1295,21 @@ R$ 130,00
 
         async function printTablePreview(bill) {
             if (isPrintAgentConnected()) return printThermal('caixa', bill.id, bill);
-            const targetId = sharedPrintAgentId();
+            let targetId = sharedPrintAgentId();
+            if (!targetId && printAgentPresenceChannel && printAgentPresenceSubscribed) {
+                try {
+                    const sent = await printAgentPresenceChannel.send({
+                        type: 'broadcast', event: 'status-request', payload: {}
+                    });
+                    if (sent !== 'ok') console.warn('Não foi possível solicitar o status do agente de impressão:', sent);
+                } catch (error) {
+                    console.warn('Não foi possível solicitar o status do agente de impressão:', error);
+                }
+                for (let attempt = 0; attempt < 16 && !targetId; attempt++) {
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                    targetId = sharedPrintAgentId();
+                }
+            }
             if (!targetId) {
                 toast('Pré-conta não impressa: mantenha o PDV e o agente abertos no computador da impressora.');
                 return false;

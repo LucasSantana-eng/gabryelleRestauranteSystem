@@ -280,6 +280,8 @@ test('table preview without a connected printer is reported instead of pretendin
     const context = {
         isPrintAgentConnected: () => false,
         sharedPrintAgentId: () => null,
+        printAgentPresenceChannel: null,
+        printAgentPresenceSubscribed: false,
         toast: message => messages.push(message)
     };
     const printTablePreview = extractFunction(
@@ -290,6 +292,70 @@ test('table preview without a connected printer is reported instead of pretendin
     );
     assert.equal(await printTablePreview({ id: 1 }), false);
     assert.match(messages[0], /não impressa/);
+});
+
+test('table preview asks for printer presence and waits for a response before sending', async () => {
+    let targetAvailable = false;
+    const sentEvents = [];
+    const calls = [];
+    const context = {
+        isPrintAgentConnected: () => false,
+        sharedPrintAgentId: () => targetAvailable ? 'cashier-1' : null,
+        printAgentPresenceChannel: {
+            send: async event => {
+                sentEvents.push(event.event);
+                if (event.event === 'status-request') targetAvailable = true;
+                return 'ok';
+            }
+        },
+        printAgentPresenceSubscribed: true,
+        callOrderBridge: async action => {
+            calls.push(action);
+            return action === 'table_preview_create' ? { jobId: 'job-1' } : { status: 'printed' };
+        },
+        setTimeout: resolve => resolve(),
+        toast() {},
+        console,
+        Date
+    };
+    const printTablePreview = extractFunction(
+        '        async function printTablePreview(',
+        '        function initRealtimeOnlineOrders(',
+        'printTablePreview',
+        context
+    );
+    assert.equal(await printTablePreview({ id: 1 }), true);
+    assert.deepEqual(sentEvents, ['status-request', 'table-preview']);
+    assert.deepEqual(calls, ['table_preview_create', 'table_preview_status']);
+});
+
+test('printer presence uses receive time to tolerate devices with different clocks', () => {
+    const handlers = {};
+    const channel = {
+        on(_type, filter, callback) { handlers[filter.event] = callback; return this; },
+        subscribe() { return this; }
+    };
+    const context = {
+        supabaseClient: { channel: () => channel },
+        printAgentPresenceChannel: null,
+        printAgentPresenceSources: new Map(),
+        PRINT_AGENT_PRESENCE_SOURCE_ID: 'mobile',
+        isPrintAgentConnected: () => true,
+        publishPrintAgentPresence() { context.responded = true; },
+        updateQzConnectionIndicator() {},
+        Date
+    };
+    const init = extractFunction(
+        '        function initPrintAgentPresence()',
+        '        async function publishPrintAgentPresence(',
+        'initPrintAgentPresence',
+        context
+    );
+    init();
+    handlers.status({ payload: { sourceId: 'cashier', connected: true, sentAt: 1 } });
+    assert.ok(Date.now() - context.printAgentPresenceSources.get('cashier') < 1000);
+    handlers['status-request']();
+    assert.equal(context.responded, true);
 });
 
 test('pizza menu shows medium, large and family sizes before flavor selection', () => {
