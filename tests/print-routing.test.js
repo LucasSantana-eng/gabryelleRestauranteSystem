@@ -140,6 +140,158 @@ test('accepted online orders print on the remote agent even when normal auto-pri
     assert.equal(printCount, 1);
 });
 
+test('accepting an online order starts local printing before synchronization completes', async () => {
+    let resolveImport;
+    let markPrintStarted;
+    const printStarted = new Promise(resolve => { markPrintStarted = resolve; });
+    const context = {
+        onlinePendingOrderIds: new Set(['online-1']),
+        canHandleOnlineOrders: () => true,
+        callOrderBridge: async () => ({ order: { id: 'online-1' } }),
+        syncOnlineOrderAlert() {},
+        importAcceptedOnlineOrder: (_order, onOrderReady) => {
+            onOrderReady({ id: 72503, printRequested: false });
+            return new Promise(resolve => { resolveImport = () => resolve({ id: 72503, printRequested: false }); });
+        },
+        printBothThermal: () => {
+            markPrintStarted();
+            return Promise.resolve(true);
+        },
+        toast() {},
+        refreshOnlineOrders: async () => {}
+    };
+    const acceptOnlineOrder = extractFunction(
+        '        async function acceptOnlineOrder(',
+        '        async function rejectOnlineOrder(',
+        'acceptOnlineOrder',
+        context
+    );
+
+    const acceptance = acceptOnlineOrder('online-1');
+    await printStarted;
+    assert.equal(typeof resolveImport, 'function');
+    resolveImport();
+    await acceptance;
+});
+
+test('online order printing can start after local save while network sync is pending', async () => {
+    let resolveUpsert;
+    let orderReady = false;
+    let orderMarkedImported = false;
+    const context = {
+        S: { orders: [{ id: 72504, onlineOrderId: 'online-2' }] },
+        KEY: 'state',
+        localStorage: { setItem() {} },
+        supabaseClient: {
+            from: () => ({
+                upsert: () => new Promise(resolve => { resolveUpsert = resolve; })
+            })
+        },
+        sharedStateSaveCount: 0,
+        sharedStateUpdatedAt: '',
+        callOrderBridge: async action => {
+            assert.equal(action, 'staff_imported');
+            orderMarkedImported = true;
+        }
+    };
+    const importAcceptedOnlineOrder = extractFunction(
+        '        async function importAcceptedOnlineOrder(',
+        '        function switchTab(',
+        'importAcceptedOnlineOrder',
+        context
+    );
+
+    const importing = importAcceptedOnlineOrder(
+        { id: 'online-2', payload: {} },
+        () => { orderReady = true; }
+    );
+    assert.equal(orderReady, true);
+    assert.equal(orderMarkedImported, false);
+    resolveUpsert({ error: null });
+    await importing;
+
+    assert.equal(orderMarkedImported, true);
+    assert.equal(context.sharedStateSaveCount, 0);
+});
+
+test('table preview requested remotely is confirmed only after the printer reports success', async () => {
+    const calls = [];
+    const messages = [];
+    const context = {
+        isPrintAgentConnected: () => false,
+        sharedPrintAgentId: () => 'cashier-1',
+        callOrderBridge: async (action, data) => {
+            calls.push([action, data]);
+            return action === 'table_preview_create' ? { jobId: 'job-1' } : { status: 'printed' };
+        },
+        printAgentPresenceChannel: { send: async () => 'ok' },
+        printAgentPresenceSubscribed: true,
+        toast: message => messages.push(message),
+        setTimeout: resolve => resolve(),
+        console,
+        Date
+    };
+    const printTablePreview = extractFunction(
+        '        async function printTablePreview(',
+        '        function initRealtimeOnlineOrders(',
+        'printTablePreview',
+        context
+    );
+    const bill = { id: 1, mesa: 2, accountPreview: true };
+
+    assert.equal(await printTablePreview(bill), true);
+    assert.equal(calls[0][0], 'table_preview_create');
+    assert.equal(calls[0][1].bill, bill);
+    assert.equal(calls[1][0], 'table_preview_status');
+    assert.match(messages.at(-1), /enviada para a impressora/);
+});
+
+test('cashier processes one remote preview and reports printer failure', async () => {
+    const calls = [];
+    const context = {
+        tablePreviewWorkerBusy: false,
+        lastTablePreviewWorkerError: '',
+        currentUser: { id: 1 },
+        isPrintAgentConnected: () => true,
+        PRINT_AGENT_PRESENCE_SOURCE_ID: 'cashier-1',
+        callOrderBridge: async (action, data) => {
+            calls.push([action, data]);
+            return action === 'table_preview_claim' ? { job: { id: 'job-1', bill: { id: 9 } } } : {};
+        },
+        printThermal: async () => false,
+        toast() {},
+        console
+    };
+    const processJob = extractFunction(
+        '        async function processTablePreviewPrintJob()',
+        '        async function printTablePreview(',
+        'processTablePreviewPrintJob',
+        context
+    );
+    await processJob();
+    assert.equal(calls[0][0], 'table_preview_claim');
+    assert.equal(calls[1][0], 'table_preview_result');
+    assert.equal(calls[1][1].printed, false);
+    assert.equal(context.tablePreviewWorkerBusy, false);
+});
+
+test('table preview without a connected printer is reported instead of pretending success', async () => {
+    const messages = [];
+    const context = {
+        isPrintAgentConnected: () => false,
+        sharedPrintAgentId: () => null,
+        toast: message => messages.push(message)
+    };
+    const printTablePreview = extractFunction(
+        '        async function printTablePreview(',
+        '        function initRealtimeOnlineOrders(',
+        'printTablePreview',
+        context
+    );
+    assert.equal(await printTablePreview({ id: 1 }), false);
+    assert.match(messages[0], /não impressa/);
+});
+
 test('pizza menu shows medium, large and family sizes before flavor selection', () => {
     const elements = {
         'menu-search': { value: '' },
@@ -290,6 +442,65 @@ test('filtering pizza flavors keeps selected flavors available and shows an empt
     assert.match(flavorsList.innerHTML, /Nenhum sabor encontrado/);
 });
 
+test('pizza builder offers savory and sweet flavors together and keeps selections when changing type', () => {
+    const flavorsList = { innerHTML: '' };
+    const context = {
+        pm: { d: 0, s: 2, fl: ['Calabresa'], flavorSearch: '' },
+        S: { menu: { mf: [4, 4, 2, 4] } },
+        PZ: [['Calabresa', 'Queijo e calabresa']],
+        DOCE: [['Brigadeiro', 'Chocolate']],
+        SIZES: ['Pequena', 'Média', 'Grande', 'Família'],
+        renderPM() {},
+        toast() {},
+        $: () => flavorsList
+    };
+    extractFunction('        function pizzaFlavorMatches(', '        function renderPMFlavors(', 'pizzaFlavorMatches', context);
+    const renderPMFlavors = extractFunction('        function renderPMFlavors(', '        function renderPM()', 'renderPMFlavors', context);
+    const pmFl = extractFunction('        function pmFl(', '        function pmAc(', 'pmFl', context);
+    const pmSet = extractFunction('        function pmSet(', '        function pmFl(', 'pmSet', context);
+
+    renderPMFlavors();
+    assert.match(flavorsList.innerHTML, /Calabresa.*Salgada/);
+    assert.match(flavorsList.innerHTML, /Brigadeiro.*Doce/);
+    pmFl('Brigadeiro');
+    pmSet('d', 1);
+    assert.deepEqual(context.pm.fl, ['Calabresa', 'Brigadeiro']);
+    context.pm.flavorSearch = 'brig';
+    renderPMFlavors();
+    assert.match(flavorsList.innerHTML, /Brigadeiro.*Doce/);
+    assert.doesNotMatch(flavorsList.innerHTML, /Calabresa/);
+});
+
+test('mixed pizza uses the greater effective price and requires both prices to be configured', () => {
+    const added = [];
+    const messages = [];
+    const context = {
+        pm: { d: 0, s: 2, fl: ['Calabresa', 'Brigadeiro'], ac: [0], q: 1, o: '' },
+        S: { menu: { pt: [0, 0, 70, 0], pd: [0, 0, 80, 0], ac: [['Borda', 5]] } },
+        PZ: [['Calabresa', 'Queijo e calabresa']],
+        DOCE: [['Brigadeiro', 'Chocolate']],
+        SIZES: ['Pequena', 'Média', 'Grande', 'Família'],
+        promotionPrice: (key, price) => key === 'pizza:pd:2' ? price - 20 : price,
+        addCart: order => added.push(order),
+        toast: message => messages.push(message),
+        closePizza() {}
+    };
+    const pmPrice = extractFunction('        function isMixedPizza()', '        function pmSet(', 'pmPrice', context);
+    const addPizza = extractFunction('        function addPizza()', '        // ---------- Carrinho ----------', 'addPizza', context);
+
+    assert.equal(pmPrice(), 75);
+    addPizza();
+    assert.equal(added[0].price, 75);
+    assert.deepEqual(Array.from(added[0].det), ['Calabresa', 'Brigadeiro', '+ Borda']);
+    context.S.menu.pd[2] = 0;
+    addPizza();
+    assert.equal(added.length, 1);
+    assert.match(messages[0], /Configure os preços/);
+    context.S.menu.pd[2] = 80;
+    context.pm.fl = ['Brigadeiro'];
+    assert.equal(pmPrice(), 65);
+});
+
 test('online checkout payload matches the order bridge contract', () => {
     const buildOnlineOrderPayload = extractOnlineMenuFunction(
         '        function roundOnlineMoney(',
@@ -333,6 +544,10 @@ test('online menu navigation uses the requested restaurant name', () => {
     );
     assert.match(header, /Restaurante e Pizzaria Gabryelle/);
     assert.doesNotMatch(header, /GABRYELLE\s*<span[^>]*>PRIME<\/span>/);
+});
+
+test('checkout fields use a 16px minimum font size to prevent mobile focus zoom', () => {
+    assert.match(onlineMenuHtml, /#cartModal input,\s*#cartModal select\s*\{\s*font-size:\s*16px;/);
 });
 
 test('online pizza size opens an empty flavor selection with the correct maximum', () => {
@@ -575,6 +790,97 @@ test('accepted online orders delegate printing only when the agent is remote', (
     assert.equal(shouldDelegateAcceptedOnlinePrint(), false);
 });
 
+test('online pending orders render even when importing an accepted order fails', async () => {
+    let modalHidden = true;
+    let renderedOrders = [];
+    const elements = {
+        'online-orders-modal': {
+            classList: {
+                contains: value => value === 'hidden' && modalHidden
+            }
+        },
+        'online-orders-count': { textContent: '0' },
+        'online-orders-status': { classList: { toggle() {} }, textContent: '' }
+    };
+    const context = {
+        onlineOrdersLoading: false,
+        onlineOrdersRefreshPending: false,
+        onlineSeenPending: new Set(),
+        onlinePendingOrderIds: new Set(),
+        canHandleOnlineOrders: () => true,
+        callOrderBridge: async () => ({
+            orders: [
+                { id: 'pending-1', status: 'pending' },
+                { id: 'accepted-1', status: 'accepted', pos_imported: false }
+            ]
+        }),
+        syncOnlineOrderAlert() {},
+        openOnlineOrdersModal() { modalHidden = false; },
+        renderOnlineOrderQueue(orders) { renderedOrders = orders; },
+        importAcceptedOnlineOrder: async () => {
+            throw new Error('Falha ao importar pedido aceito');
+        },
+        $(id) { return elements[id]; },
+        toast() {},
+        console: { error() {} }
+    };
+    const refreshOnlineOrders = extractFunction(
+        '        async function refreshOnlineOrders()',
+        '        function playOnlineOrderAlert()',
+        'refreshOnlineOrders',
+        context
+    );
+
+    await refreshOnlineOrders();
+
+    assert.equal(modalHidden, false);
+    assert.equal(elements['online-orders-count'].textContent, '1');
+    assert.deepEqual(JSON.parse(JSON.stringify(renderedOrders.map(order => order.id))), ['pending-1']);
+    assert.match(elements['online-orders-status'].textContent, /Falha ao atualizar pedidos online/);
+});
+
+test('online order refresh repeats if a new notification arrives during an active request', async () => {
+    let resolveFirstRequest;
+    let requestCount = 0;
+    const context = {
+        onlineOrdersLoading: false,
+        onlineOrdersRefreshPending: false,
+        onlineSeenPending: new Set(),
+        onlinePendingOrderIds: new Set(),
+        canHandleOnlineOrders: () => true,
+        callOrderBridge: () => {
+            requestCount++;
+            if (requestCount === 1) {
+                return new Promise(resolve => { resolveFirstRequest = resolve; });
+            }
+            return Promise.resolve({ orders: [] });
+        },
+        syncOnlineOrderAlert() {},
+        renderOnlineOrderQueue() {},
+        openOnlineOrdersModal() {},
+        importAcceptedOnlineOrder: async () => {},
+        $: id => id === 'online-orders-status'
+            ? { classList: { toggle() {} }, textContent: '' }
+            : { classList: { contains: () => false }, textContent: '0' },
+        toast() {},
+        console
+    };
+    const refreshOnlineOrders = extractFunction(
+        '        async function refreshOnlineOrders()',
+        '        function playOnlineOrderAlert()',
+        'refreshOnlineOrders',
+        context
+    );
+
+    const activeRequest = refreshOnlineOrders();
+    await refreshOnlineOrders();
+    resolveFirstRequest({ orders: [] });
+    await activeRequest;
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(requestCount, 2);
+});
+
 test('inline scripts in the POS and online menu parse successfully', () => {
     for (const [file, source] of [['index.html', html], ['cardapio online.html', onlineMenuHtml]]) {
         const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)];
@@ -594,6 +900,17 @@ test('online order staff authorization requires eight-digit privileged PINs', ()
     assert.match(orderBridge, /!\/\^\\d\{4,8\}\$\/\.test\(pin\)/);
     assert.match(orderBridge, /const requiredPinLength = \["ADMIN", "GERENTE", "CAIXA"\]\.includes\(data\?\.role\) \? 8 : 4/);
     assert.match(orderBridge, /pin\.length !== requiredPinLength/);
+});
+
+test('online order acceptance does not wait for realtime notifications before printing can start', () => {
+    const acceptStart = orderBridge.indexOf('if (body.action === "staff_accept" || body.action === "staff_reject")');
+    const acceptEnd = orderBridge.indexOf('if (body.action === "staff_imported")', acceptStart);
+    assert.notEqual(acceptStart, -1);
+    assert.notEqual(acceptEnd, -1);
+    const acceptHandler = orderBridge.slice(acceptStart, acceptEnd);
+    assert.match(acceptHandler, /const notifications = Promise\.all\(/);
+    assert.match(acceptHandler, /EdgeRuntime\.waitUntil\(notifications\)/);
+    assert.doesNotMatch(acceptHandler, /await Promise\.all\(/);
 });
 
 test('online menu shows the updated restaurant name and address consistently', () => {

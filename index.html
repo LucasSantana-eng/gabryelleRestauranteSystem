@@ -798,8 +798,12 @@
         <div class="bg-dark-card border border-dark-border rounded-2xl w-full max-w-3xl max-h-[90vh] flex flex-col shadow-2xl">
             <div class="p-4 border-b border-dark-border flex items-center justify-between">
                 <div><h3 class="font-bold text-white">Pedidos do cardápio online</h3><p class="text-xs text-gray-400 mt-1">Aceite para enviar à cozinha ou recuse o pedido.</p></div>
-                <button onclick="closeOnlineOrdersModal()" class="text-gray-400 hover:text-white text-xl" aria-label="Fechar">✕</button>
+                <div class="flex items-center gap-3">
+                    <button onclick="refreshOnlineOrders()" class="text-xs text-emerald-400 hover:text-emerald-300" aria-label="Atualizar pedidos online">Atualizar</button>
+                    <button onclick="closeOnlineOrdersModal()" class="text-gray-400 hover:text-white text-xl" aria-label="Fechar">✕</button>
+                </div>
             </div>
+            <p id="online-orders-status" class="hidden px-4 pt-3 text-xs text-red-300" role="status" aria-live="polite"></p>
             <div id="online-orders-list" class="p-4 overflow-y-auto space-y-3"></div>
         </div>
     </div>
@@ -860,6 +864,7 @@
         let currentUser = null;
         const ORDER_BRIDGE_URL = `${SUPABASE_URL}/functions/v1/order-bridge`;
         let onlineOrdersLoading = false;
+        let onlineOrdersRefreshPending = false;
         let onlineOrdersTimer = null;
         let onlineAlarmTimer = null;
         let onlinePendingOrderIds = new Set();
@@ -877,6 +882,8 @@
         let lastSharedStateSaveError = '';
         let printAgentPresenceChannel = null;
         let printAgentPresenceSubscribed = false;
+        let tablePreviewWorkerBusy = false;
+        let lastTablePreviewWorkerError = '';
         const printAgentPresenceSources = new Map();
         const PRINT_AGENT_PRESENCE_HEARTBEAT_MS = 5000;
         const PRINT_AGENT_PRESENCE_TIMEOUT_MS = 15000;
@@ -1048,6 +1055,9 @@ R$ 130,00
                     }
                     updateQzConnectionIndicator();
                 })
+                .on('broadcast', { event: 'table-preview' }, message => {
+                    if (message.payload?.targetId === PRINT_AGENT_PRESENCE_SOURCE_ID) processTablePreviewPrintJob();
+                })
                 .subscribe(status => {
                     printAgentPresenceSubscribed = status === 'SUBSCRIBED';
                     if (printAgentPresenceSubscribed && isPrintAgentConnected()) {
@@ -1079,16 +1089,20 @@ R$ 130,00
             }
         }
 
-        function isSharedPrintAgentOnline() {
+        function sharedPrintAgentId() {
             const cutoff = Date.now() - PRINT_AGENT_PRESENCE_TIMEOUT_MS;
             for (const [sourceId, lastSeen] of printAgentPresenceSources) {
                 if (lastSeen < cutoff) {
                     printAgentPresenceSources.delete(sourceId);
                 } else {
-                    return true;
+                    return sourceId;
                 }
             }
-            return false;
+            return null;
+        }
+
+        function isSharedPrintAgentOnline() {
+            return sharedPrintAgentId() !== null;
         }
 
         const automaticPrintQueue = new Set();
@@ -1258,6 +1272,67 @@ R$ 130,00
             return result;
         }
 
+        async function processTablePreviewPrintJob() {
+            if (tablePreviewWorkerBusy || !currentUser || !isPrintAgentConnected()) return;
+            tablePreviewWorkerBusy = true;
+            try {
+                const targetId = PRINT_AGENT_PRESENCE_SOURCE_ID;
+                const { job } = await callOrderBridge('table_preview_claim', { targetId });
+                lastTablePreviewWorkerError = '';
+                if (!job) return;
+                const printed = await printThermal('caixa', job.bill.id, job.bill);
+                await callOrderBridge('table_preview_result', { targetId, jobId: job.id, printed });
+                if (!printed) toast('Falha ao imprimir a pré-conta solicitada pelo celular.');
+            } catch (error) {
+                console.error('Falha ao processar pré-conta remota:', error);
+                if (lastTablePreviewWorkerError !== error.message) toast(`Falha na impressão remota: ${error.message}`);
+                lastTablePreviewWorkerError = error.message;
+            } finally {
+                tablePreviewWorkerBusy = false;
+            }
+        }
+
+        async function printTablePreview(bill) {
+            if (isPrintAgentConnected()) return printThermal('caixa', bill.id, bill);
+            const targetId = sharedPrintAgentId();
+            if (!targetId) {
+                toast('Pré-conta não impressa: mantenha o PDV e o agente abertos no computador da impressora.');
+                return false;
+            }
+            try {
+                const { jobId } = await callOrderBridge('table_preview_create', { targetId, bill });
+                toast('Pré-conta enviada ao computador da impressora. Aguarde a confirmação.');
+                if (printAgentPresenceChannel && printAgentPresenceSubscribed) {
+                    try {
+                        const sent = await printAgentPresenceChannel.send({
+                            type: 'broadcast', event: 'table-preview', payload: { targetId }
+                        });
+                        if (sent !== 'ok') console.warn('Aviso de pré-conta não confirmado; a verificação periódica continuará ativa:', sent);
+                    } catch (error) {
+                        console.warn('Falha ao avisar o computador; a verificação periódica continuará ativa:', error);
+                    }
+                }
+                const deadline = Date.now() + 45000;
+                while (Date.now() < deadline) {
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    const { status } = await callOrderBridge('table_preview_status', { targetId, jobId });
+                    if (status === 'printed') {
+                        toast('Pré-conta enviada para a impressora.');
+                        return true;
+                    }
+                    if (status === 'failed') {
+                        toast('Não foi possível imprimir a pré-conta. Verifique a impressora no computador.');
+                        return false;
+                    }
+                }
+                toast('Impressão não confirmada. Confira a impressora antes de tentar novamente.');
+            } catch (error) {
+                console.error('Falha ao solicitar pré-conta remota:', error);
+                toast(`Não foi possível confirmar a pré-conta: ${error.message}`);
+            }
+            return false;
+        }
+
         function initRealtimeOnlineOrders() {
             if (!supabaseClient || realtimeOnlineOrdersChannel) return;
             realtimeOnlineOrdersChannel = supabaseClient
@@ -1310,7 +1385,11 @@ R$ 130,00
         }
 
         async function refreshOnlineOrders() {
-            if (!canHandleOnlineOrders() || onlineOrdersLoading) return;
+            if (!canHandleOnlineOrders()) return;
+            if (onlineOrdersLoading) {
+                onlineOrdersRefreshPending = true;
+                return;
+            }
             onlineOrdersLoading = true;
             try {
                 const result = await callOrderBridge('staff_list');
@@ -1321,24 +1400,37 @@ R$ 130,00
                 onlinePendingOrderIds = new Set(pending.map(order => order.id));
                 syncOnlineOrderAlert();
                 if (newPending.length && $('online-orders-modal').classList.contains('hidden')) {
-                    openOnlineOrdersModal();
+                    openOnlineOrdersModal(false);
                 }
 
+                $('online-orders-count').textContent = String(pending.length);
+                renderOnlineOrderQueue(pending);
+                setOnlineOrdersStatus('');
+                lastOnlineOrderError = '';
                 for (const order of orders) {
                     if (order.status === 'accepted' && !order.pos_imported) {
                         await importAcceptedOnlineOrder(order);
                     }
                 }
-                $('online-orders-count').textContent = String(pending.length);
-                renderOnlineOrderQueue(pending);
-                lastOnlineOrderError = '';
             } catch (error) {
                 console.error('Falha ao carregar pedidos online:', error);
+                setOnlineOrdersStatus(`Falha ao atualizar pedidos online: ${error.message}`);
                 if (lastOnlineOrderError !== error.message) toast(`Pedidos online: ${error.message}`);
                 lastOnlineOrderError = error.message;
             } finally {
                 onlineOrdersLoading = false;
+                if (onlineOrdersRefreshPending) {
+                    onlineOrdersRefreshPending = false;
+                    refreshOnlineOrders();
+                }
             }
+        }
+
+        function setOnlineOrdersStatus(message) {
+            const status = $('online-orders-status');
+            if (!status) return;
+            status.textContent = message;
+            status.classList.toggle('hidden', !message);
         }
 
         function playOnlineOrderAlert() {
@@ -1429,11 +1521,11 @@ R$ 130,00
             }).join('') || '<p class="py-8 text-center text-sm text-gray-400">Nenhum pedido online aguardando confirmação.</p>';
         }
 
-        function openOnlineOrdersModal() {
+        function openOnlineOrdersModal(refresh = true) {
             if (!canHandleOnlineOrders()) return toast('Faça login como administrador, gerente ou caixa para ver os pedidos online.');
             $('online-orders-modal').classList.remove('hidden');
             $('online-orders-modal').classList.add('flex');
-            refreshOnlineOrders();
+            if (refresh) refreshOnlineOrders();
         }
 
         function closeOnlineOrdersModal() {
@@ -1449,11 +1541,14 @@ R$ 130,00
                 accepted = true;
                 onlinePendingOrderIds.delete(orderId);
                 syncOnlineOrderAlert();
-                const importedOrder = await importAcceptedOnlineOrder(result.order);
+                let printPromise = null;
+                const importedOrder = await importAcceptedOnlineOrder(result.order, order => {
+                    if (!order.printRequested) printPromise = printBothThermal(order);
+                });
                 if (importedOrder.printRequested) {
                     toast('Pedido online aceito e enviado ao agente de impressão do computador do caixa.');
                 } else {
-                    const printed = await printBothThermal(importedOrder);
+                    const printed = await (printPromise || printBothThermal(importedOrder));
                     toast(printed
                         ? 'Pedido online aceito, importado e impresso.'
                         : 'Pedido online aceito e importado, mas não foi possível confirmar a impressão. Verifique o agente e reimprima pelo PDV.');
@@ -1484,7 +1579,7 @@ R$ 130,00
             }
         }
 
-        async function importAcceptedOnlineOrder(onlineOrder) {
+        async function importAcceptedOnlineOrder(onlineOrder, onOrderReady = null) {
             const payload = onlineOrder.payload || {};
             const customer = payload.customer || {};
             const existing = S.orders.find(order => order.onlineOrderId === onlineOrder.id);
@@ -1531,6 +1626,7 @@ R$ 130,00
             } catch (error) {
                 throw new Error(`Não foi possível salvar o pedido no dispositivo: ${error.message}`);
             }
+            if (onOrderReady) onOrderReady(importedOrder);
             if (!supabaseClient) throw new Error('Supabase indisponível; o pedido ficará pendente de sincronização.');
             sharedStateSaveCount++;
             try {
@@ -2688,6 +2784,7 @@ R$ 130,00
             setInterval(() => {
                 if (isPrintAgentConnected()) publishPrintAgentPresence(true);
             }, PRINT_AGENT_PRESENCE_HEARTBEAT_MS);
+            setInterval(processTablePreviewPrintJob, 30000);
             setInterval(updateMesaAgeIndicators, 30000);
             if (printAgentToken) {
                 connectPrintAgent().catch(error => {
@@ -2805,16 +2902,25 @@ R$ 130,00
             $('pizza-modal').classList.remove('hidden'); $('pizza-modal').classList.add('flex');
         }
         function closePizza() { $('pizza-modal').classList.add('hidden'); $('pizza-modal').classList.remove('flex'); }
+        function isMixedPizza() {
+            return pm.fl.some(name => PZ.some(flavor => flavor[0] === name))
+                && pm.fl.some(name => DOCE.some(flavor => flavor[0] === name));
+        }
+        function pizzaIsSweet() {
+            if (!pm.fl.length || isMixedPizza()) return Boolean(pm.d);
+            return pm.fl.some(name => DOCE.some(flavor => flavor[0] === name));
+        }
+        function pizzaBasePrice(size) {
+            const M = S.menu, sweet = pizzaIsSweet();
+            return isMixedPizza()
+                ? Math.max(promotionPrice(`pizza:pt:${size}`, M.pt[size]), promotionPrice(`pizza:pd:${size}`, M.pd[size]))
+                : promotionPrice(`pizza:${sweet ? 'pd' : 'pt'}:${size}`, (sweet ? M.pd : M.pt)[size]);
+        }
         function pmPrice() {
-            const M = S.menu, key = `pizza:${pm.d ? 'pd' : 'pt'}:${pm.s}`;
-            return promotionPrice(key, (pm.d ? M.pd : M.pt)[pm.s]) + pm.ac.reduce((a, i) => a + M.ac[i][1], 0);
+            return pizzaBasePrice(pm.s) + pm.ac.reduce((a, i) => a + S.menu.ac[i][1], 0);
         }
         function pmSet(k, v) {
             pm[k] = v;
-            if (k === 'd') {
-                pm.fl = [];
-                pm.flavorSearch = '';
-            }
             pm.fl = pm.fl.slice(0, S.menu.mf[pm.s]); renderPM();
         }
         function pmFl(n) {
@@ -2831,23 +2937,24 @@ R$ 130,00
             return !query || normalize(flavor[0] + ' ' + flavor[1]).includes(query);
         }
         function renderPMFlavors() {
-            const L = pm.d ? DOCE : PZ;
+            const L = pm.d ? [...DOCE, ...PZ] : [...PZ, ...DOCE];
             const flavors = L.filter(flavor => pizzaFlavorMatches(flavor, pm.flavorSearch || ''));
             $('pm-flavor-list').innerHTML = flavors.map(p => {
                 const on = pm.fl.includes(p[0]);
-                return `<label class="flex items-start gap-2 p-2 rounded-lg border cursor-pointer ${on ? 'border-gold-500 bg-gold-500/10' : 'border-dark-border'}"><input type="checkbox" ${on ? 'checked' : ''} onchange="pmFl('${p[0]}')" class="mt-0.5"><span><b class="text-white">${p[0]}</b><br><span class="text-gray-400">${p[1]}</span></span></label>`;
+                const tipo = DOCE.includes(p) ? 'Doce' : 'Salgada';
+                return `<label class="flex items-start gap-2 p-2 rounded-lg border cursor-pointer ${on ? 'border-gold-500 bg-gold-500/10' : 'border-dark-border'}"><input type="checkbox" ${on ? 'checked' : ''} onchange="pmFl('${p[0]}')" class="mt-0.5"><span><b class="text-white">${p[0]}</b> <span class="text-gray-400">(${tipo})</span><br><span class="text-gray-400">${p[1]}</span></span></label>`;
             }).join('') || '<p class="p-3 text-center text-xs text-gray-400">Nenhum sabor encontrado.</p>';
         }
         function renderPM() {
-            const M = S.menu, t = pm.d ? M.pd : M.pt, sc = $('pm-body').scrollTop;
+            const M = S.menu, sc = $('pm-body').scrollTop;
             const tab = on => `flex-1 py-2 rounded-lg border text-center font-semibold ${on ? 'bg-gold-500 text-black border-gold-500' : 'border-dark-border text-gray-300'}`;
             const lbl = 'text-gray-400 mb-1 font-semibold uppercase text-[10px]';
             $('pm-body').innerHTML = `
                 <div class="flex gap-2"><button onclick="pmSet('d',0)" class="${tab(!pm.d)}">Salgada</button><button onclick="pmSet('d',1)" class="${tab(pm.d)}">Doce</button></div>
                 ${pm.sizeSelected
                     ? `<div class="rounded-lg border border-gold-500/40 bg-gold-500/10 p-3 text-center"><div class="${lbl}">Tamanho selecionado</div><div class="font-bold text-white">Pizza ${SIZES[pm.s]}</div></div>`
-                    : `<div><div class="${lbl}">Tamanho</div><div class="grid grid-cols-4 gap-2">${SIZES.map((z, i) => { const price = promotionPrice(`pizza:${pm.d ? 'pd' : 'pt'}:${i}`, t[i]); return `<button onclick="pmSet('s',${i})" class="${tab(pm.s === i)}"><div>${z}</div><div class="font-normal">${price ? money(price) : 'sem preço'}${price !== t[i] ? ' • promo' : ''}</div></button>`; }).join('')}</div></div>`}
-                <div><div class="${lbl}">Sabores (${pm.fl.length}/${M.mf[pm.s]})</div><input type="search" value="${esc(pm.flavorSearch || '')}" oninput="pm.flavorSearch=this.value;renderPMFlavors()" aria-label="Filtrar sabores da pizza" placeholder="Digite para filtrar sabores..." class="mb-2 w-full bg-dark-bg border border-dark-border rounded-lg p-2.5 text-sm text-gray-200 placeholder:text-gray-500 focus:outline-none focus:border-gold-500"><div id="pm-flavor-list" class="space-y-1 max-h-64 overflow-y-auto"></div></div>
+                    : `<div><div class="${lbl}">Tamanho</div><div class="grid grid-cols-4 gap-2">${SIZES.map((z, i) => { const regularPrice = isMixedPizza() ? Math.max(M.pt[i], M.pd[i]) : (pizzaIsSweet() ? M.pd[i] : M.pt[i]); const price = pizzaBasePrice(i); return `<button onclick="pmSet('s',${i})" class="${tab(pm.s === i)}"><div>${z}</div><div class="font-normal">${price ? money(price) : 'sem preço'}${price !== regularPrice ? ' • promo' : ''}</div></button>`; }).join('')}</div></div>`}
+                <div><div class="${lbl}">Sabores (${pm.fl.length}/${M.mf[pm.s]})</div><p class="mb-2 text-gray-400">Misture sabores salgados e doces. Na pizza mista, vale o maior preço do tamanho.</p><input type="search" value="${esc(pm.flavorSearch || '')}" oninput="pm.flavorSearch=this.value;renderPMFlavors()" aria-label="Filtrar sabores da pizza" placeholder="Digite para filtrar sabores..." class="mb-2 w-full bg-dark-bg border border-dark-border rounded-lg p-2.5 text-sm text-gray-200 placeholder:text-gray-500 focus:outline-none focus:border-gold-500"><div id="pm-flavor-list" class="space-y-1 max-h-64 overflow-y-auto"></div></div>
                 <div><div class="${lbl}">Acréscimos</div><div class="grid grid-cols-2 gap-1">${M.ac.map((a, i) => `<label class="flex items-center gap-2 p-1.5 rounded border border-dark-border cursor-pointer"><input type="checkbox" ${pm.ac.includes(i) ? 'checked' : ''} onchange="pmAc(${i})"><span class="text-gray-200">${a[0]} <span class="text-gray-500">${a[1] ? '+' + money(a[1]) : ''}</span></span></label>`).join('')}</div></div>
                 <div><div class="grid grid-cols-3 gap-2"><div><div class="${lbl}">Qtd</div><input type="number" min="1" value="${pm.q}" oninput="pm.q=Math.max(1,+this.value||1);pmTot()" class="w-full bg-dark-bg border border-dark-border rounded-lg p-2 text-gray-200"></div><div class="col-span-2"><div class="${lbl}">Observação</div><input value="${esc(pm.o)}" oninput="pm.o=this.value" placeholder="Ex: sem cebola, bem passada" class="w-full bg-dark-bg border border-dark-border rounded-lg p-2 text-gray-200"></div></div></div>`;
             renderPMFlavors();
@@ -2856,8 +2963,10 @@ R$ 130,00
         function pmTot() { $('pm-total').textContent = 'Total: ' + money(pmPrice() * pm.q); }
         function addPizza() {
             if (!pm.fl.length) return toast('Escolha pelo menos 1 sabor');
-            if (!pmPrice() || !(pm.d ? S.menu.pd : S.menu.pt)[pm.s]) return toast('Tamanho sem preço. Defina em Cardápio / Preços.');
-            addCart({ name: `Pizza ${SIZES[pm.s]}${pm.d ? ' Doce' : ''}`, category: pm.d ? 'Pizzas Doces' : 'Pizzas', qty: pm.q, price: pmPrice(), det: [...pm.fl, ...pm.ac.map(i => '+ ' + S.menu.ac[i][0])], obs: pm.o.trim() });
+            if (isMixedPizza() && (!S.menu.pt[pm.s] || !S.menu.pd[pm.s])) return toast('Configure os preços de pizza salgada e doce para este tamanho em Cardápio / Preços.');
+            const sweet = pizzaIsSweet();
+            if (!pmPrice() || !(sweet ? S.menu.pd : S.menu.pt)[pm.s]) return toast('Tamanho sem preço. Defina em Cardápio / Preços.');
+            addCart({ name: `Pizza ${SIZES[pm.s]}${sweet ? ' Doce' : ''}`, category: sweet ? 'Pizzas Doces' : 'Pizzas', qty: pm.q, price: pmPrice(), det: [...pm.fl, ...pm.ac.map(i => '+ ' + S.menu.ac[i][0])], obs: pm.o.trim() });
             closePizza();
         }
 
@@ -2998,7 +3107,7 @@ R$ 130,00
             updatePaymentPreview();
             if (mesaNumber !== null) {
                 const bill = createMesaBill(mesaNumber, openOrders);
-                printThermal('caixa', bill.id, bill);
+                printTablePreview(bill);
             }
         }
         function addPaymentLine(method = 'PIX', amount = 0) {

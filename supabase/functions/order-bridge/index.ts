@@ -218,7 +218,7 @@ Deno.serve(async request => {
         .maybeSingle();
       if (error) throw error;
       if (!data) return jsonResponse(409, { error: "Este pedido já foi processado por outro operador." });
-      await Promise.all([
+      const notifications = Promise.all([
         broadcastOnlineEvent("online-orders-notifications", "order-update", {
           orderId: data.id,
           status: data.status,
@@ -228,6 +228,7 @@ Deno.serve(async request => {
           status: data.status,
         }),
       ]);
+      EdgeRuntime.waitUntil(notifications);
       const order = { ...data };
       delete order.tracking_hash;
       return jsonResponse(200, { order, handledBy: staff.name });
@@ -248,6 +249,68 @@ Deno.serve(async request => {
       if (error) throw error;
       if (!data) return jsonResponse(409, { error: "Pedido já importado ou não aceito." });
       return jsonResponse(200, { imported: true });
+    }
+
+    if (typeof body.action === "string" && body.action.startsWith("table_preview_")) {
+      const staff = await authorizeStaff(body);
+      if (!staff) return jsonResponse(401, { error: "Acesso não autorizado." });
+      const targetId = body.targetId;
+      if (typeof targetId !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(targetId)) {
+        return jsonResponse(400, { error: "Destino de impressão inválido." });
+      }
+
+      if (body.action === "table_preview_create") {
+        const bill = body.bill as Record<string, unknown> | null;
+        if (!bill || bill.type !== "MESA" || bill.accountPreview !== true ||
+          typeof bill.mesa !== "number" || !Number.isInteger(bill.mesa) || bill.mesa < 1 ||
+          !Array.isArray(bill.items) || !bill.items.length ||
+          JSON.stringify(bill).length > 100000) {
+          return jsonResponse(400, { error: "Pré-conta inválida." });
+        }
+        const { error: cleanupError } = await adminClient.from("table_preview_print_jobs")
+          .delete().lt("created_at", new Date(Date.now() - 86400000).toISOString());
+        if (cleanupError) throw cleanupError;
+        const { data, error } = await adminClient.from("table_preview_print_jobs")
+          .insert({ requested_by: String(staff.id), target_id: targetId, bill })
+          .select("id").single();
+        if (error) throw error;
+        return jsonResponse(201, { jobId: data.id });
+      }
+
+      if (body.action === "table_preview_claim") {
+        const cutoff = new Date(Date.now() - 60000).toISOString();
+        const { data: pending, error: listError } = await adminClient.from("table_preview_print_jobs")
+          .select("id").eq("target_id", targetId).eq("status", "pending")
+          .gte("created_at", cutoff).order("created_at", { ascending: true }).limit(1).maybeSingle();
+        if (listError) throw listError;
+        if (!pending) return jsonResponse(200, { job: null });
+        const { data, error } = await adminClient.from("table_preview_print_jobs")
+          .update({ status: "printing" }).eq("id", pending.id).eq("target_id", targetId)
+          .eq("status", "pending").select("id,bill").maybeSingle();
+        if (error) throw error;
+        return jsonResponse(200, { job: data });
+      }
+
+      if (typeof body.jobId !== "string" || !/^[0-9a-f-]{36}$/i.test(body.jobId)) {
+        return jsonResponse(400, { error: "Solicitação de impressão inválida." });
+      }
+      if (body.action === "table_preview_result") {
+        if (typeof body.printed !== "boolean") return jsonResponse(400, { error: "Resultado de impressão inválido." });
+        const { data, error } = await adminClient.from("table_preview_print_jobs")
+          .update({ status: body.printed ? "printed" : "failed" }).eq("id", body.jobId)
+          .eq("target_id", targetId).eq("status", "printing").select("id").maybeSingle();
+        if (error) throw error;
+        if (!data) return jsonResponse(409, { error: "Solicitação de impressão não encontrada." });
+        return jsonResponse(200, { updated: true });
+      }
+      if (body.action === "table_preview_status") {
+        const { data, error } = await adminClient.from("table_preview_print_jobs")
+          .select("status").eq("id", body.jobId).eq("target_id", targetId)
+          .eq("requested_by", String(staff.id)).maybeSingle();
+        if (error) throw error;
+        if (!data) return jsonResponse(404, { error: "Solicitação de impressão não encontrada." });
+        return jsonResponse(200, { status: data.status });
+      }
     }
 
     return jsonResponse(400, { error: "Unknown action." });
